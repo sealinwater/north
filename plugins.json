@@ -1,0 +1,25 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/NordicBytesPlugin.cs3",
+        "status": 1,
+        "version": 11,
+        "name": "North",
+        "internalName": "NordicBytesPlugin",
+        "authors": [
+            "North \u2022 sealinwater"
+        ],
+        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features 100% Freeleech & 2x Upload priority, Full Season Pack episode selector, and 48h Auto-Seed Bridge.",
+        "fileSize": 90142,
+        "repositoryUrl": "https://github.com/sealinwater/north",
+        "language": "da",
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Documentary"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-a96bb20f6bf865c1044562a41951b25fb20547a4a4da8c69c50b9b776be12486"
+    }
+]
