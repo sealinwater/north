@@ -1,15 +1,15 @@
 [
     {
-        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/NordicBytesPlugin.cs3",
+        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3",
         "status": 1,
-        "version": 13,
-        "name": "NordicBytesPlugin",
-        "internalName": "NordicBytesPlugin",
+        "version": 14,
+        "name": "North",
+        "internalName": "North",
         "authors": [
             "North \u2022 sealinwater"
         ],
-        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features Ghost Ratio Proxy (0 B Download), 100% Freeleech & 2x Upload badges, Skip Resum\u00e9/Intro/Outro, Seamless Episode Continuity, and Auto Nordic Subtitles.",
-        "fileSize": 120302,
+        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features Direct Video Streaming, Active Ratio Builder (0 B Download + Boosted Upload), In-Player Skip Resum\u00e9/Intro/Outro UI, Seamless Episode Continuity, and Auto Nordic Subtitles.",
+        "fileSize": 129533,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-e0c7c8d28a3a60d43cf11529bb4d0ae46f0efa0ce8a412cc87cbab911583d98e"
+        "fileHash": "sha256-c534815f86e3c73ad0528c6b71c9a5472180ed7293dc91a1582e71d33e5dfb4c"
     }
 ]
