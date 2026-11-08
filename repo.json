@@ -1,0 +1,8 @@
+{
+  "name": "North",
+  "description": "North • Deep Blue Nordic Cloudstream Extension Repository (by sealinwater)",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/sealinwater/north/builds/plugins.json"
+  ]
+}
