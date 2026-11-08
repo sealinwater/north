@@ -9,7 +9,7 @@
             "North \u2022 sealinwater"
         ],
         "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features 100% Freeleech & 2x Upload priority, Full Season Pack episode selector, and 48h Auto-Seed Bridge.",
-        "fileSize": 92901,
+        "fileSize": 92960,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-60e339a582e318945c101f21505b20e8652438e4458751cf67cbcdc24fb27b04"
+        "fileHash": "sha256-f43ffa7fc1ba860eecbf17c4862fcfb1035bd8aad3f9cc967c6a4a01e84e4b69"
     }
 ]
