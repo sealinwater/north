@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3",
         "status": 1,
-        "version": 15,
+        "version": 16,
         "name": "North",
         "internalName": "North",
         "authors": [
             "North \u2022 sealinwater"
         ],
-        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features Multi-Page Category Pagination (loadMore), Fast RAM Streaming, Active Ratio Builder (0 B Download + Boosted Upload), In-Player Skip Resum\u00e9/Intro/Outro UI, and Auto Nordic Subtitles.",
-        "fileSize": 136323,
+        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features Multi-Page Category Pagination (loadMore), Fast RAM Streaming, Active Ratio Builder (0 B Download + Boosted Upload), Validated TheIntroDB/IntroDB Skip Intro & Recap UI, and Auto Nordic Subtitles.",
+        "fileSize": 143165,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-9f0291f193895136748b261df4b1eb47759156f85c3fd3eb40f18378fce0dfaf"
+        "fileHash": "sha256-20c25fcede839299b82efb1d6ae0f4a4c281dd97047e5d840e53675246fee994"
     }
 ]
