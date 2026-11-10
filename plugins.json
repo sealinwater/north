@@ -9,7 +9,7 @@
             "North \u2022 sealinwater"
         ],
         "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features In-Player Skip Intro/Outro & Validated TheIntroDB Skip Recap Buttons, Ratio-Safe Chromecast (castSession) LAN Proxy, Multi-Page Category Pagination (loadMore), and Active Ratio Builder (0 B Download + Boosted Upload).",
-        "fileSize": 157905,
+        "fileSize": 158799,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,7 +20,7 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-b3ca54c6bc2318361facca829f5e9a7bd21739cbc8344817bdae26fbdb17a8d0"
+        "fileHash": "sha256-13703b459d776f9fa1071867394649c20679076f289b0223481e8e1fe0c87df2"
     },
     {
         "url": "https://raw.githubusercontent.com/sealinwater/north/builds/NordicBytesPlugin.cs3",
@@ -32,7 +32,7 @@
             "North \u2022 sealinwater"
         ],
         "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features In-Player Skip Intro/Outro & Validated TheIntroDB Skip Recap Buttons, Ratio-Safe Chromecast (castSession) LAN Proxy, Multi-Page Category Pagination (loadMore), and Active Ratio Builder (0 B Download + Boosted Upload).",
-        "fileSize": 157905,
+        "fileSize": 158799,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -43,6 +43,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-b3ca54c6bc2318361facca829f5e9a7bd21739cbc8344817bdae26fbdb17a8d0"
+        "fileHash": "sha256-13703b459d776f9fa1071867394649c20679076f289b0223481e8e1fe0c87df2"
     }
 ]
