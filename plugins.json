@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3",
         "status": 1,
-        "version": 17,
+        "version": 18,
         "name": "North",
         "internalName": "North",
         "authors": [
             "North \u2022 sealinwater"
         ],
-        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features Ratio-Safe Chromecast (castSession) LAN Proxy, Multi-Page Category Pagination (loadMore), Fast RAM Streaming, Active Ratio Builder (0 B Download + Boosted Upload), and Validated TheIntroDB/IntroDB Skip UI.",
-        "fileSize": 154816,
+        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features In-Player Skip Intro/Outro & Validated TheIntroDB Skip Recap Buttons, Ratio-Safe Chromecast (castSession) LAN Proxy, Multi-Page Category Pagination (loadMore), and Active Ratio Builder (0 B Download + Boosted Upload).",
+        "fileSize": 157905,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,29 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-45bf3941cd48dacdb93c9cfcec0138b82a96e0b4aa5a15a640b993245d04a722"
+        "fileHash": "sha256-b3ca54c6bc2318361facca829f5e9a7bd21739cbc8344817bdae26fbdb17a8d0"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/NordicBytesPlugin.cs3",
+        "status": 1,
+        "version": 18,
+        "name": "North",
+        "internalName": "NordicBytesPlugin",
+        "authors": [
+            "North \u2022 sealinwater"
+        ],
+        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features In-Player Skip Intro/Outro & Validated TheIntroDB Skip Recap Buttons, Ratio-Safe Chromecast (castSession) LAN Proxy, Multi-Page Category Pagination (loadMore), and Active Ratio Builder (0 B Download + Boosted Upload).",
+        "fileSize": 157905,
+        "repositoryUrl": "https://github.com/sealinwater/north",
+        "language": "da",
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Anime",
+            "Documentary"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-b3ca54c6bc2318361facca829f5e9a7bd21739cbc8344817bdae26fbdb17a8d0"
     }
 ]
