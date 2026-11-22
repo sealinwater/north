@@ -1,15 +1,15 @@
 [
     {
-        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/NordicBytesPlugin.cs3",
+        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3",
         "status": 1,
-        "version": 11,
+        "version": 30,
         "name": "North",
-        "internalName": "NordicBytesPlugin",
+        "internalName": "North",
         "authors": [
             "North \u2022 sealinwater"
         ],
-        "description": "North \u2022 Deep Blue Nordic Movie & Series Tracker Extension. Features 100% Freeleech & 2x Upload priority, Full Season Pack episode selector, and 48h Auto-Seed Bridge.",
-        "fileSize": 90142,
+        "description": "\u26a0\ufe0f ACCOUNT API KEY REQUIRED: North requires a NordicBytes (nordicbytes.org) account & API Key to work. HOW TO SIGN UP & GET A KEY: 1) Apply at https://nordicbytes.org/application \u2014 your application text & experience level are public for community vouching (NEVER include your real name, address, or personal info!), while your email and at least 2 tracker proof screenshots + profile URLs are staff-only (required; no proof = rejection). 2) Once logged in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API Token. 3) Open Cloudstream -> Settings -> Extensions -> North (Gear Icon), paste your key, and Save. Features NORTH Studio Intro, Companion Proxy API, Seekable MKV/MP4 Streaming, Chromecast Stereo AAC Transcoding, TheIntroDB Skip Buttons & Ghost Ratio Protection.",
+        "fileSize": 232715,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-a96bb20f6bf865c1044562a41951b25fb20547a4a4da8c69c50b9b776be12486"
+        "fileHash": "sha256-8c74ea3efbed98874d81c56f851663d190384bc4eddfa90bb0e4e41191216167"
     }
 ]
