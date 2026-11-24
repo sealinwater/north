@@ -128,12 +128,12 @@ class NordicBytesPlugin : Plugin() {
         NordicBytesProvider.playNorthIntroEnabled = prefs.getBoolean("play_north_intro", true)
         NordicBytesProvider.proxyApiBaseUrl = (prefs.getString("proxy_api_url", NordicBytesProvider.DEFAULT_PROXY_API_URL)
             ?: NordicBytesProvider.DEFAULT_PROXY_API_URL).trim().trimEnd('/')
-        if (prefs.getInt("exo_cache_purged_version", 0) < 31) {
+        if (prefs.getInt("exo_cache_purged_version", 0) < 32) {
             try {
                 File(appContext.cacheDir, "exoplayer").deleteRecursively()
             } catch (_: Throwable) {
             }
-            prefs.edit().putInt("exo_cache_purged_version", 31).apply()
+            prefs.edit().putInt("exo_cache_purged_version", 32).apply()
         }
         NordicBytesProvider.purgeStaleExoPlayerSimpleCache()
         NordicBytesProvider.registerNorthSkipApi()
@@ -330,7 +330,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V31"
+            text = "NORTH • SEALINWATER • V32"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD

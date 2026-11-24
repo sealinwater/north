@@ -191,11 +191,22 @@ class NorthSkipAPI : SkipAPI() {
         return intersection.toDouble() / minDur.toDouble()
     }
 
-    private suspend fun fetchJsonOrNull(url: String): JSONObject? {
+    private fun fetchJsonOrNull(url: String): JSONObject? {
         return try {
-            val response = app.get(url)
-            if (response.code !in 200..299) return null
-            val text = response.text.trim()
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "CloudStream/4.6 North/32")
+                connectTimeout = 3500
+                readTimeout = 3500
+            }
+            val code = conn.responseCode
+            val text = if (code in 200..299) {
+                conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText().trim() }
+            } else {
+                ""
+            }
+            conn.disconnect()
             if (!text.startsWith("{")) return null
             JSONObject(text)
         } catch (_: Throwable) {
@@ -233,11 +244,40 @@ class NorthSkipAPI : SkipAPI() {
         val season = episode.season ?: 1
         val epNum = episode.episode
 
-        // 1. Try North Companion Proxy API (/api/skips) first only if configured and healthy
         var theIntroDbRoot: JSONObject? = null
         var introDbRoot: JSONObject? = null
+
+        // 1. Query public TheIntroDB (api.theintrodb.org/v4/media) directly first for instant ~120ms latency
+        if (tmdbId != null && (isMovieMedia || (season > 0 && epNum > 0))) {
+            val tmdbUrl = if (isMovieMedia) {
+                "https://api.theintrodb.org/v4/media?tmdb_id=$tmdbId"
+            } else {
+                "https://api.theintrodb.org/v4/media?tmdb_id=$tmdbId&season=$season&episode=$epNum"
+            }
+            theIntroDbRoot = fetchJsonOrNull(tmdbUrl)
+        }
+        if (theIntroDbRoot == null && imdbId != null && (isMovieMedia || (season > 0 && epNum > 0))) {
+            val imdbUrl = if (isMovieMedia) {
+                "https://api.theintrodb.org/v4/media?imdb_id=$imdbId"
+            } else {
+                "https://api.theintrodb.org/v4/media?imdb_id=$imdbId&season=$season&episode=$epNum"
+            }
+            theIntroDbRoot = fetchJsonOrNull(imdbUrl)
+        }
+
+        // 2. Query public IntroDB (api.introdb.app/segments) directly for TV series episodes when imdbId is available
+        if (!isMovieMedia && imdbId != null && season > 0 && epNum > 0) {
+            introDbRoot = fetchJsonOrNull("https://api.introdb.app/segments?imdb_id=$imdbId&season=$season&episode=$epNum")
+        }
+
+        // 3. Fallback to North Companion Proxy API (/api/skips) only if direct lookups returned nothing
         val proxyBase = NordicBytesProvider.proxyApiBaseUrl.trim().trimEnd('/')
-        if (NordicBytesProvider.isCompanionProxyAvailable() && (tmdbId != null || imdbId != null) && (isMovieMedia || (season > 0 && epNum > 0))) {
+        if (theIntroDbRoot == null && introDbRoot == null &&
+            NordicBytesProvider.isCompanionProxyAvailable() &&
+            !proxyBase.contains("ais-pre-", ignoreCase = true) &&
+            (tmdbId != null || imdbId != null) &&
+            (isMovieMedia || (season > 0 && epNum > 0))
+        ) {
             val proxyUrl = buildString {
                 append(proxyBase).append("/api/skips?")
                 var hasParam = false
@@ -263,29 +303,6 @@ class NorthSkipAPI : SkipAPI() {
             } else {
                 NordicBytesProvider.markCompanionProxyUnhealthy()
             }
-        }
-
-        // 2. Fallback to direct TheIntroDB (api.theintrodb.org/v4/media) by tmdb_id and/or imdb_id
-        if (theIntroDbRoot == null && tmdbId != null && (isMovieMedia || (season > 0 && epNum > 0))) {
-            val tmdbUrl = if (isMovieMedia) {
-                "https://api.theintrodb.org/v4/media?tmdb_id=$tmdbId"
-            } else {
-                "https://api.theintrodb.org/v4/media?tmdb_id=$tmdbId&season=$season&episode=$epNum"
-            }
-            theIntroDbRoot = fetchJsonOrNull(tmdbUrl)
-        }
-        if (theIntroDbRoot == null && imdbId != null && (isMovieMedia || (season > 0 && epNum > 0))) {
-            val imdbUrl = if (isMovieMedia) {
-                "https://api.theintrodb.org/v4/media?imdb_id=$imdbId"
-            } else {
-                "https://api.theintrodb.org/v4/media?imdb_id=$imdbId&season=$season&episode=$epNum"
-            }
-            theIntroDbRoot = fetchJsonOrNull(imdbUrl)
-        }
-
-        // 3. Fallback to direct IntroDB (api.introdb.app/segments) for TV series episodes when imdbId is available
-        if (introDbRoot == null && !isMovieMedia && imdbId != null && season > 0 && epNum > 0) {
-            introDbRoot = fetchJsonOrNull("https://api.introdb.app/segments?imdb_id=$imdbId&season=$season&episode=$epNum")
         }
 
         val noRecapFlag = introDbRoot?.optBoolean("no_recap", false) == true
@@ -606,6 +623,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private val transcodedStreamUrls = ConcurrentHashMap<String, Boolean>()
         private val mkvCuesTailCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
         private val mkvCuesTailWarmInProgress = ConcurrentHashMap<String, Boolean>()
+        private val torrUrlToCastQueryMap = ConcurrentHashMap<String, String>()
 
         @Volatile
         private var activeWifiLock: WifiManager.WifiLock? = null
@@ -689,10 +707,48 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             return null
         }
 
+        private fun notifyPlayerUpdatedTimeForSkips(playerFrag: AbstractPlayerFragment<*>?) {
+            try {
+                val p = playerFrag?.player ?: return
+                val dur = p.getDuration() ?: 0L
+                if (dur <= 0L) return
+                val m = p.javaClass.getMethod(
+                    "updatedTime",
+                    java.lang.Long::class.java,
+                    PlayerEventSource::class.java
+                )
+                m.invoke(p, null, PlayerEventSource.Player)
+            } catch (_: Throwable) {
+            }
+        }
+
+        /**
+         * Ensures `CS3IPlayer.updatedTime(null, PlayerEventSource.Player)` is triggered once
+         * `UpdatedMatroskaExtractor` resolves `duration > 0` (and after the NORTH pre-roll overlay
+         * is dismissed), guaranteeing `GeneratorPlayer.loadStamps(duration)` and `TimestampInvokedEvent`
+         * ("Skip Intro" button) always fire even if `onRenderFirst()` ran before duration was known
+         * or while the pre-roll overlay was visible.
+         */
+        fun schedulePostStartSkipSync(isCastingNow: Boolean) {
+            if (isCastingNow || !isSkipIntrosEnabled) return
+            val mainHandler = Handler(Looper.getMainLooper())
+            val delaysMs = longArrayOf(400L, 1_200L, 2_400L, 3_800L, 5_500L, 8_000L)
+            for (delayMs in delaysMs) {
+                mainHandler.postDelayed({
+                    if (isIntroOverlayActive) return@postDelayed
+                    val act = CommonActivity.activity as? AppCompatActivity ?: return@postDelayed
+                    if (act.isFinishing || act.isDestroyed) return@postDelayed
+                    val playerFrag = findActivePlayerFragment(act.supportFragmentManager) ?: return@postDelayed
+                    notifyPlayerUpdatedTimeForSkips(playerFrag)
+                }, delayMs)
+            }
+        }
+
         /**
          * Displays the branded full-screen **NORTH** intro (video + crisp native title card)
          * as content begins to load/play inside CloudStream's player, pausing the underlying episode
-         * cleanly for ~2.6s and resuming playback seamlessly with intact seeking.
+         * cleanly for ~2.6s and resuming playback seamlessly without calling `seekTo(0L)` (which would
+         * abort `UpdatedMatroskaExtractor`'s initial EOF Cues seek).
          */
         fun triggerNorthIntroPreRoll(isCastingNow: Boolean) {
             if (isCastingNow || !playNorthIntroEnabled || isIntroOverlayActive) return
@@ -733,6 +789,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                     if (existingPos > 1_500L) {
                         lastIntroPlayerIdentity = fragId
+                        schedulePostStartSkipSync(isCastingNow = false)
                         return
                     }
 
@@ -745,7 +802,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         return
                     }
 
-                    val initialPosAtOverlayAttach = existingPos.coerceAtLeast(0L)
                     val density = act.resources.displayMetrics.density
                     fun dpPx(v: Int): Int = (v * density).toInt()
 
@@ -825,12 +881,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         try {
                             val p = playerFrag.player
                             if (p != null) {
-                                // Only seek to 0 if the video started at 0 when the overlay attached and drifted <1.8s
-                                // before the first pause tick; NEVER reset a resumed Continue Watching position!
-                                val pos = p.getPosition() ?: 0L
-                                if (initialPosAtOverlayAttach <= 300L && pos in 1L..1_800L) {
-                                    p.seekTo(0L, PlayerEventSource.UI)
-                                }
+                                // CRITICAL: Do NOT call p.seekTo(0L) here! Calling seekTo(0L) at t=2.65s aborts
+                                // UpdatedMatroskaExtractor's initial EOF Cues request before MatroskaSeekMap is built.
                                 p.handleEvent(CSPlayerEvent.Play, PlayerEventSource.UI)
                             }
                         } catch (_: Throwable) {
@@ -845,6 +897,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                 } catch (_: Throwable) {
                                 }
                                 isIntroOverlayActive = false
+                                schedulePostStartSkipSync(isCastingNow = false)
                             }
                             .start()
                     }
@@ -1102,6 +1155,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             transcodedStreamUrls.clear()
             mkvCuesTailCache.clear()
             mkvCuesTailWarmInProgress.clear()
+            torrUrlToCastQueryMap.clear()
             lastSuccessfulApiTimestamp = 0L
             proxyApiUnhealthyUntilMs = 0L
             purgeStaleExoPlayerSimpleCache()
@@ -1109,7 +1163,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
         /**
          * Purges any cached `/cast/stream.mp4` spans from CloudStream's persistent `CS3IPlayer.simpleCache`
-         * so `CacheDataSource` never serves stale v29/v30 patched headers or partial ranges from disk.
+         * so `CacheDataSource` never serves stale v29/v30/v31 headers or partial ranges from disk.
          */
         fun purgeStaleExoPlayerSimpleCache() {
             try {
@@ -1122,7 +1176,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val rawKeys = getKeysMethod.invoke(cacheInstance) as? Set<*> ?: return
                 val snapshot = rawKeys.mapNotNull { it as? String }.toList()
                 for (key in snapshot) {
-                    if (key.contains("/cast/stream.mp4", ignoreCase = true)) {
+                    if (key.contains("/cast/stream.mp4", ignoreCase = true) ||
+                        key.contains("127.0.0.1", ignoreCase = true)
+                    ) {
                         try {
                             removeResourceMethod.invoke(cacheInstance, key)
                         } catch (_: Throwable) {
@@ -1197,26 +1253,66 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         /**
-         * Registers `NorthSkipAPI` into CloudStream's `SkipAPI.skipApis` list, replacing the
-         * unvalidated built-in `TheIntroDBSkip` and `IntroDbSkip` instances so CloudStream never
-         * renders a bogus `0ms..0ms` or `0ms..episodeDurationMs` Skip Recap button when `recap`
-         * is null/empty.
+         * Registers `NorthSkipAPI` into CloudStream's `SkipAPI.skipApis` list (mutating both the
+         * in-place `Arrays$ArrayList` backing array `a` for Android ART JIT compatibility AND the
+         * static `skipApis` field), replacing the unvalidated built-in `TheIntroDBSkip` and `IntroDbSkip`
+         * instances so CloudStream always uses `NorthSkipAPI`.
          */
         fun registerNorthSkipApi() {
             try {
+                val northApi = NorthSkipAPI()
                 val field = SkipAPI::class.java.getDeclaredField("skipApis")
                 field.isAccessible = true
                 @Suppress("UNCHECKED_CAST")
                 val current = (field.get(null) as? List<SkipAPI>) ?: emptyList()
-                if (current.firstOrNull() !is NorthSkipAPI) {
+
+                // 1. Mutate the existing List / Arrays$ArrayList backing array in-place so Android ART JIT
+                //    inlined references to `static final skipApis` also see NorthSkipAPI at index 0!
+                try {
+                    if (current is MutableList<*>) {
+                        @Suppress("UNCHECKED_CAST")
+                        val mut = current as MutableList<SkipAPI>
+                        if (mut.isNotEmpty()) {
+                            mut[0] = northApi
+                            for (i in 1 until mut.size) {
+                                val item = mut[i]
+                                if (item is TheIntroDBSkip || item is IntroDbSkip) {
+                                    mut[i] = northApi
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    val arrField = current.javaClass.getDeclaredField("a")
+                    arrField.isAccessible = true
+                    val backingArr = arrField.get(current) as? Array<*>
+                    if (backingArr != null && backingArr.isNotEmpty()) {
+                        @Suppress("UNCHECKED_CAST")
+                        val typedArr = backingArr as Array<Any?>
+                        typedArr[0] = northApi
+                        for (i in 1 until typedArr.size) {
+                            val item = typedArr[i]
+                            if (item is TheIntroDBSkip || item is IntroDbSkip) {
+                                typedArr[i] = northApi
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+
+                // 2. Also update the static field reference with a clean deduplicated list
+                if (current.firstOrNull() !is NorthSkipAPI || current.any { it is TheIntroDBSkip || it is IntroDbSkip }) {
                     val filtered = current.filterNot {
                         it is NorthSkipAPI || it is TheIntroDBSkip || it is IntroDbSkip
                     }
                     val updated = ArrayList<SkipAPI>(filtered.size + 1)
-                    updated.add(NorthSkipAPI())
+                    updated.add(northApi)
                     updated.addAll(filtered)
                     field.set(null, updated)
                 }
+
                 val cacheField = SkipAPI::class.java.getDeclaredField("cachedStamps")
                 cacheField.isAccessible = true
                 (cacheField.get(null) as? MutableMap<*, *>)?.clear()
@@ -2122,8 +2218,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (!forceReAdd) {
                 castStreamUrlCache[cacheKey]?.let { cached ->
                     val base = resolveRunningTorrServerUrl()
-                    val cachedHash = cached.substringAfter("link=", "").substringBefore("&").trim()
-                    if (isTorrServerAlive(base) && (cachedHash.isBlank() || queryTorrServerStatus(base, cachedHash) != null)) {
+                    if (cached.startsWith(base)) {
                         return cached
                     }
                 }
@@ -2133,8 +2228,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val currentBase = resolveRunningTorrServerUrl()
                 if (!forceReAdd) {
                     castStreamUrlCache[cacheKey]?.let { cached ->
-                        val cachedHash = cached.substringAfter("link=", "").substringBefore("&").trim()
-                        if (isTorrServerAlive(currentBase) && (cachedHash.isBlank() || queryTorrServerStatus(currentBase, cachedHash) != null)) {
+                        if (cached.startsWith(currentBase)) {
                             return cached
                         }
                     }
@@ -2347,69 +2441,20 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
         }
 
-        /**
-         * Pre-starts and tunes TorrServer cleanly, adds the top torrent, and launches keep-alive
-         * in the background WITHOUT opening an aborted `bytes=0-3` HTTP reader that would race
-         * with ExoPlayer's continuous `&play` stream connection.
-         */
         private fun warmMkvCuesTailAsync(
             torrStreamUrl: String,
             cuesOffset: Long,
             totalFileBytes: Long
         ) {
-            if (cuesOffset <= 0L) return
-            if (totalFileBytes > 0L && (cuesOffset >= totalFileBytes || totalFileBytes - cuesOffset > 2_097_152L)) return
-            if (mkvCuesTailCache.containsKey(torrStreamUrl)) return
-            if (mkvCuesTailWarmInProgress.putIfAbsent(torrStreamUrl, true) != null) return
-
-            thread(isDaemon = true, name = "North-MkvCuesTailWarm") {
-                try {
-                    val conn = (URL(torrStreamUrl).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        setRequestProperty("Range", "bytes=$cuesOffset-")
-                        setRequestProperty("User-Agent", USER_AGENT)
-                        connectTimeout = 15000
-                        readTimeout = 45000
-                    }
-                    val rCode = conn.responseCode
-                    if (rCode in 200..299) {
-                        val contentRange = conn.getHeaderField("Content-Range")
-                        var validRangeStart = cuesOffset
-                        var totalSizeFromRange = totalFileBytes
-                        if (!contentRange.isNullOrBlank() && contentRange.startsWith("bytes ")) {
-                            val afterBytes = contentRange.removePrefix("bytes ")
-                            val spec = afterBytes.substringBefore("/")
-                            validRangeStart = spec.substringBefore("-").trim().toLongOrNull() ?: cuesOffset
-                            totalSizeFromRange = afterBytes.substringAfter("/", "").trim().toLongOrNull() ?: totalFileBytes
-                        }
-                        if (validRangeStart == cuesOffset) {
-                            val baos = ByteArrayOutputStream(65536)
-                            conn.inputStream.use { inp ->
-                                val buf = ByteArray(16384)
-                                var n: Int
-                                while (inp.read(buf).also { n = it } != -1) {
-                                    baos.write(buf, 0, n)
-                                    if (baos.size() > 2_097_152) break
-                                }
-                            }
-                            val tailBytes = baos.toByteArray()
-                            val expectedLen = if (totalSizeFromRange > cuesOffset) (totalSizeFromRange - cuesOffset).toInt() else tailBytes.size
-                            if (tailBytes.isNotEmpty() && tailBytes.size <= 2_097_152 && (expectedLen <= 0 || tailBytes.size >= expectedLen)) {
-                                if (mkvCuesTailCache.size >= 8 && !mkvCuesTailCache.containsKey(torrStreamUrl)) {
-                                    mkvCuesTailCache.clear()
-                                }
-                                mkvCuesTailCache[torrStreamUrl] = Pair(cuesOffset, tailBytes)
-                            }
-                        }
-                    }
-                    conn.disconnect()
-                } catch (_: Throwable) {
-                } finally {
-                    mkvCuesTailWarmInProgress.remove(torrStreamUrl)
-                }
-            }
+            // Deprecated no-op: local ExoPlayer streams directly from TorrServer's native Go HTTP engine,
+            // so opening a separate background EOF HTTP reader would only compete with ExoPlayer's own Cues seek.
+            if (torrStreamUrl.isBlank() || cuesOffset < 0L || totalFileBytes < -1L) return
         }
 
+        /**
+         * Pre-starts and tunes TorrServer cleanly, adds the top torrent, and launches keep-alive
+         * in the background WITHOUT opening any competing HTTP range reader on `/stream/...`.
+         */
         private fun prewarmTorrServerStream(
             localTorrentUrl: String?,
             magnetFallbackUrl: String?,
@@ -2428,55 +2473,33 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         epNum = epNum
                     ) ?: return@thread
                     startTorrServerKeepAlive(streamUrl, localTorrentUrl, magnetFallbackUrl, exactIndex, seasonNum, epNum)
-
-                    // Pre-fetch the first 16 KB of the stream to warm Piece #0 and inspect Matroska SeekHead
-                    // so we can pre-cache the EOF Cues table in RAM while the NORTH intro is playing.
-                    if (!mkvCuesTailCache.containsKey(streamUrl)) {
-                        val conn = (URL(streamUrl).openConnection() as HttpURLConnection).apply {
-                            requestMethod = "GET"
-                            setRequestProperty("Range", "bytes=0-16383")
-                            setRequestProperty("User-Agent", USER_AGENT)
-                            connectTimeout = 10000
-                            readTimeout = 20000
-                        }
-                        if (conn.responseCode in 200..299) {
-                            val cr = conn.getHeaderField("Content-Range")
-                            val totalBytes = cr?.substringAfter("/", "")?.trim()?.toLongOrNull() ?: -1L
-                            val headerBuf = ByteArray(16384)
-                            var totalRead = 0
-                            conn.inputStream.use { inp ->
-                                while (totalRead < headerBuf.size) {
-                                    val r = inp.read(headerBuf, totalRead, headerBuf.size - totalRead)
-                                    if (r <= 0) break
-                                    totalRead += r
-                                }
-                            }
-                            conn.disconnect()
-                            if (totalRead >= 64) {
-                                val cuesOffset = extractMkvCuesOrChainedSeekHeadOffset(headerBuf, totalRead)
-                                if (cuesOffset > 0L) {
-                                    warmMkvCuesTailAsync(streamUrl, cuesOffset, totalBytes)
-                                }
-                            }
-                        } else {
-                            conn.disconnect()
-                        }
-                    }
                 } catch (_: Throwable) {
                 }
             }
         }
 
+        private data class ResolvedCastStreamTarget(
+            val torrStreamUrl: String,
+            val localTorrentUrl: String?,
+            val magnetFallbackUrl: String?,
+            val exactIndex: Int,
+            val targetSeason: Int,
+            val targetEpisode: Int,
+            val infoHash: String,
+            val displayName: String,
+            val explicitCastQuery: Boolean
+        )
+
         /**
-         * Unified `/cast/stream.mp4` HTTP Video Relay (combines Torrent + Magnet + Cast into 1 single source).
+         * Resolves a `/cast/stream.mp4?...` query string into its authoritative TorrServer stream URL
+         * (`http://127.0.0.1:<torrPort>/stream/<fname>?link=<hash>&index=<id>&play`) while keeping all
+         * `.torrent` and `/announce` traffic routed through our local Ghost Ratio Proxy.
          */
-        private fun handleProxyCastStream(
-            sock: Socket,
-            method: String,
+        private fun resolveDirectTorrStreamFromCastQuery(
             rawQuery: String,
-            requestHeaders: Map<String, String>,
-            localPort: Int
-        ) {
+            localPort: Int,
+            forceReAdd: Boolean = false
+        ): ResolvedCastStreamTarget? {
             var targetUrl = ""
             var token = ""
             var ghostEnabled = true
@@ -2509,12 +2532,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
-            if (targetUrl.isBlank() && infoHash.isBlank()) {
-                sendHttpResponse(sock, 400, "text/plain", "Missing url and hash".toByteArray())
-                return
-            }
+            if (targetUrl.isBlank() && infoHash.isBlank()) return null
 
-            // On-demand metadata resolution + authoritative Season Pack / Movie file index verification:
             if (targetUrl.isNotBlank() && !targetUrl.startsWith("magnet:")) {
                 val authTargetUrl = appendTokenToDownloadUrlStatic(targetUrl, token)
                 val meta = parsedTorrentCache[authTargetUrl] ?: parsedTorrentCache[targetUrl] ?: run {
@@ -2554,11 +2573,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
+            val effectivePort = if (localPort > 0) localPort else ensureLocalProxyServer()
             val ghostFlag = if (ghostEnabled) "1" else "0"
             val localTorrentUrl = if (targetUrl.isNotBlank() && !targetUrl.startsWith("magnet:")) {
                 val encUrl = URLEncoder.encode(targetUrl, "UTF-8")
                 val encTok = URLEncoder.encode(token, "UTF-8")
-                "http://127.0.0.1:$localPort/torrent?index=$exactIndex&url=$encUrl&token=$encTok&ghost=$ghostFlag"
+                "http://127.0.0.1:$effectivePort/torrent?index=$exactIndex&url=$encUrl&token=$encTok&ghost=$ghostFlag"
             } else {
                 null
             }
@@ -2572,7 +2592,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val trParams = buildString {
                         if (primaryTracker.startsWith("http")) {
                             val proxiedTr = if (ghostEnabled) {
-                                "http://127.0.0.1:$localPort/announce?upstream=${URLEncoder.encode(primaryTracker, "UTF-8")}&size=$totalSize"
+                                "http://127.0.0.1:$effectivePort/announce?upstream=${URLEncoder.encode(primaryTracker, "UTF-8")}&size=$totalSize"
                             } else {
                                 primaryTracker
                             }
@@ -2588,28 +2608,68 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 else -> null
             }
 
-            var torrStreamUrl: String = resolveTorrServerStreamUrl(
+            val torrStreamUrl = resolveTorrServerStreamUrl(
                 localTorrentUrl,
                 magnetFallbackUrl,
                 exactIndex,
-                forceReAdd = false,
+                forceReAdd = forceReAdd,
                 seasonNum = targetSeason,
                 epNum = targetEpisode
-            )?.takeIf { it.isNotBlank() } ?: run {
+            )?.takeIf { it.isNotBlank() } ?: return null
+
+            torrUrlToCastQueryMap[torrStreamUrl] = rawQuery
+            startTorrServerKeepAlive(torrStreamUrl, localTorrentUrl, magnetFallbackUrl, exactIndex, targetSeason, targetEpisode)
+
+            return ResolvedCastStreamTarget(
+                torrStreamUrl = torrStreamUrl,
+                localTorrentUrl = localTorrentUrl,
+                magnetFallbackUrl = magnetFallbackUrl,
+                exactIndex = exactIndex,
+                targetSeason = targetSeason,
+                targetEpisode = targetEpisode,
+                infoHash = infoHash,
+                displayName = displayName,
+                explicitCastQuery = explicitCastQuery
+            )
+        }
+
+        /**
+         * Unified `/cast/stream.mp4` HTTP Video Relay:
+         * - For local ExoPlayer & external players (`!isChromecastRequest`), immediately issues an
+         *   `HTTP/1.1 302 Found` redirect directly to TorrServer's native Go `http.ServeContent` stream URL
+         *   so range seeking, EOF Matroska Cues loading, and TCP FIN reader cancellation work natively
+         *   with zero proxy socket buffering.
+         * - For Chromecast devices on the LAN (`isChromecastRequest`), relays the stream over LAN HTTP
+         *   with real-time 5.1/7.1 Surround -> 2.0 Stereo AAC Matroska audio transcoding.
+         */
+        private fun handleProxyCastStream(
+            sock: Socket,
+            method: String,
+            rawQuery: String,
+            requestHeaders: Map<String, String>,
+            localPort: Int
+        ) {
+            val resolved = resolveDirectTorrStreamFromCastQuery(rawQuery, localPort, forceReAdd = false)
+            if (resolved == null) {
                 sendHttpResponse(sock, 502, "text/plain", "Unable to initialize TorrServer stream".toByteArray())
                 return
             }
-            startTorrServerKeepAlive(torrStreamUrl, localTorrentUrl, magnetFallbackUrl, exactIndex, targetSeason, targetEpisode)
+
+            var torrStreamUrl = resolved.torrStreamUrl
+            val localTorrentUrl = resolved.localTorrentUrl
+            val magnetFallbackUrl = resolved.magnetFallbackUrl
+            val exactIndex = resolved.exactIndex
+            val targetSeason = resolved.targetSeason
+            val targetEpisode = resolved.targetEpisode
+            val infoHash = resolved.infoHash
+            val displayName = resolved.displayName
+            val explicitCastQuery = resolved.explicitCastQuery
 
             var upstreamConn: HttpURLConnection? = null
             try {
                 sock.soTimeout = 0
                 sock.keepAlive = true
                 sock.tcpNoDelay = true
-                try {
-                    sock.sendBufferSize = 524_288
-                } catch (_: Throwable) {
-                }
 
                 val clientRangeHeader = requestHeaders["range"]
                 val ua = requestHeaders["user-agent"].orEmpty()
@@ -2628,7 +2688,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     false
                 }
                 val isVlcClient = ua.contains("VLC", ignoreCase = true) || ua.contains("LibVLC", ignoreCase = true)
-                // CloudStream's internal CS3IPlayer uses a default desktop Chrome User-Agent ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/149.0.0.0 Safari/537.36")
                 val isCloudStreamInternalExoPlayerUA = ua.contains("Windows NT 10.0", ignoreCase = true) && !ua.contains("CrKey", ignoreCase = true)
                 val isExternalPlayersUA = isVlcClient ||
                     isCloudStreamInternalExoPlayerUA ||
@@ -2644,6 +2703,28 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     ua.contains("Fuchsia", ignoreCase = true) ||
                     ua.contains("GoogleTV", ignoreCase = true)
                 val isChromecastRequest = isCastReceiverUA || (explicitCastQuery && isExternalLanClient) || (isExternalLanClient && !isExternalPlayersUA)
+
+                // Direct TorrServer redirect for all local players (ExoPlayer, VLC, mpv, JustPlayer, MX Player):
+                // eliminates the middleman socket proxy so TorrServer's Go net/http engine receives instant TCP FIN
+                // on every seek/scrub and handles Matroska Cues range requests natively.
+                if (!isChromecastRequest) {
+                    val out = BufferedOutputStream(sock.getOutputStream(), 4096)
+                    val redirectHeaders = buildString {
+                        append("HTTP/1.1 302 Found\r\n")
+                        append("Location: $torrStreamUrl\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("Access-Control-Allow-Origin: *\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(redirectHeaders.toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    return
+                }
+
+                try {
+                    sock.sendBufferSize = 524_288
+                } catch (_: Throwable) {
+                }
 
                 var requestedStartOffset = 0L
                 var requestedEndInclusive = -1L
@@ -6874,8 +6955,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (targetPayloads.isEmpty()) return false
 
             val castingNow = isCasting || hasActiveCastSession()
-            if (!castingNow && playNorthIntroEnabled) {
-                triggerNorthIntroPreRoll(isCastingNow = false)
+            if (!castingNow) {
+                if (playNorthIntroEnabled) {
+                    triggerNorthIntroPreRoll(isCastingNow = false)
+                } else {
+                    schedulePostStartSkipSync(isCastingNow = false)
+                }
             }
             val sortedPayloads = targetPayloads.sortedWith(
                 compareBy<StreamLinkPayload> { !it.isSeasonPack }
@@ -7011,7 +7096,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                     val castFlag = if (castingNow) "1" else "0"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.mp4?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=31"
+                        "http://$streamHost:$localPort/cast/stream.mp4?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=32"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -7067,19 +7152,84 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
     }
 
     /**
-     * Overrides `MainAPI.getVideoInterceptor` so CloudStream's `CS3IPlayer.createVideoSource`
-     * bypasses `CronetDataSource` (which has a hard 15-second `setReadTimeoutMs(15000)` that
-     * throws `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT (2002)` during torrent streaming) and
-     * instead uses `OkHttpDataSource` with a 5-minute connect/read/write timeout.
+     * Overrides `MainAPI.getVideoInterceptor` so CloudStream's `CS3IPlayer.createVideoSource`:
+     * 1. Bypasses `CronetDataSource` (which has a hard 15s `setReadTimeoutMs(15000)` that throws
+     *    `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT (2002)` during torrent piece waits) and uses
+     *    `OkHttpDataSource` instead.
+     * 2. Directly rewrites `/cast/stream.mp4` requests from local ExoPlayer to TorrServer's native
+     *    Go `http.ServeContent` URL (`http://127.0.0.1:<torrPort>/stream/<fname>?link=<hash>&index=<id>&play`)
+     *    with `Connection: close`. This ensures:
+     *    - Zero intermediate TCP socket proxy between ExoPlayer and TorrServer.
+     *    - When `UpdatedMatroskaExtractor` closes its initial `bytes=0-` stream to seek to the EOF
+     *      `Cues` index, or when the user drags the timeline seekbar / taps "Skip Intro", OkHttp
+     *      immediately closes the TCP socket (`Connection: close`) instead of calling `Util.skipAll`
+     *      to drain gigabytes of remaining video bytes, and TorrServer's Go HTTP engine immediately
+     *      receives the TCP FIN (`r.Context().Done()`) and cancels the abandoned BitTorrent piece reader.
+     *    - If TorrServer ever evicts the torrent from RAM (returning HTTP 404/410), the interceptor
+     *      transparently re-adds the torrent via the Ghost Ratio Proxy and retries the exact `Range`
+     *      request seamlessly.
      */
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
             lastKeepAliveTouchMs = System.currentTimeMillis()
-            chain
-                .withConnectTimeout(60, TimeUnit.SECONDS)
-                .withReadTimeout(5, TimeUnit.MINUTES)
-                .withWriteTimeout(5, TimeUnit.MINUTES)
-                .proceed(chain.request())
+            val req = chain.request()
+            val urlStr = req.url.toString()
+
+            var activeReq = req
+            var castQueryForRetry: String? = null
+
+            if (urlStr.contains("/cast/stream.mp4")) {
+                val rawQuery = req.url.encodedQuery.orEmpty()
+                castQueryForRetry = rawQuery
+                if (req.url.queryParameter("cast") != "1") {
+                    val localPort = ensureLocalProxyServer()
+                    val resolvedTarget = resolveDirectTorrStreamFromCastQuery(
+                        rawQuery = rawQuery,
+                        localPort = localPort,
+                        forceReAdd = false
+                    )
+                    val directTorrUrl = resolvedTarget?.torrStreamUrl
+                    if (!directTorrUrl.isNullOrBlank()) {
+                        activeReq = req.newBuilder()
+                            .url(directTorrUrl)
+                            .header("Connection", "close")
+                            .build()
+                    }
+                }
+            } else if (urlStr.contains("/stream/")) {
+                castQueryForRetry = torrUrlToCastQueryMap[urlStr]
+                activeReq = req.newBuilder()
+                    .header("Connection", "close")
+                    .build()
+            }
+
+            val timedChain = chain
+                .withConnectTimeout(30, TimeUnit.SECONDS)
+                .withReadTimeout(45, TimeUnit.SECONDS)
+                .withWriteTimeout(45, TimeUnit.SECONDS)
+
+            val response = timedChain.proceed(activeReq)
+            if ((response.code == 404 || response.code == 410) && !castQueryForRetry.isNullOrBlank()) {
+                val localPort = ensureLocalProxyServer()
+                val refreshedTarget = resolveDirectTorrStreamFromCastQuery(
+                    rawQuery = castQueryForRetry,
+                    localPort = localPort,
+                    forceReAdd = true
+                )
+                val refreshedTorrUrl = refreshedTarget?.torrStreamUrl
+                if (!refreshedTorrUrl.isNullOrBlank()) {
+                    try {
+                        response.close()
+                    } catch (_: Throwable) {
+                    }
+                    val retryReq = req.newBuilder()
+                        .url(refreshedTorrUrl)
+                        .header("Connection", "close")
+                        .build()
+                    return@Interceptor timedChain.proceed(retryReq)
+                }
+            }
+            response
         }
     }
 }
