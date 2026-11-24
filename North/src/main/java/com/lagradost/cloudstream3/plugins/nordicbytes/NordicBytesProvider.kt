@@ -624,6 +624,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private val mkvCuesTailCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
         private val mkvCuesTailWarmInProgress = ConcurrentHashMap<String, Boolean>()
         private val torrUrlToCastQueryMap = ConcurrentHashMap<String, String>()
+        private val subtitleResponseCache = ConcurrentHashMap<String, Pair<String, ByteArray>>()
 
         @Volatile
         private var activeWifiLock: WifiManager.WifiLock? = null
@@ -1156,16 +1157,23 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             mkvCuesTailCache.clear()
             mkvCuesTailWarmInProgress.clear()
             torrUrlToCastQueryMap.clear()
+            subtitleResponseCache.clear()
             lastSuccessfulApiTimestamp = 0L
             proxyApiUnhealthyUntilMs = 0L
             purgeStaleExoPlayerSimpleCache()
         }
 
         /**
-         * Purges any cached `/cast/stream.mp4` spans from CloudStream's persistent `CS3IPlayer.simpleCache`
-         * so `CacheDataSource` never serves stale v29/v30/v31 headers or partial ranges from disk.
+         * Purges any cached `/cast/stream` spans from CloudStream's persistent `CS3IPlayer.simpleCache`,
+         * disables `Mp4PreviewGenerator` (`PreviewGenerator`) if active, and evicts CloudStream's 15-minute
+         * `app.baseClient.cache` (`http_cache`) so `CacheDataSource` and `RepositoryManager` never serve
+         * stale headers, partial ranges, or cached `plugins.json` from disk.
          */
         fun purgeStaleExoPlayerSimpleCache() {
+            try {
+                com.lagradost.cloudstream3.app.baseClient.cache?.evictAll()
+            } catch (_: Throwable) {
+            }
             try {
                 val playerClass = Class.forName("com.lagradost.cloudstream3.ui.player.CS3IPlayer")
                 val cacheField = playerClass.getDeclaredField("simpleCache")
@@ -1176,7 +1184,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val rawKeys = getKeysMethod.invoke(cacheInstance) as? Set<*> ?: return
                 val snapshot = rawKeys.mapNotNull { it as? String }.toList()
                 for (key in snapshot) {
-                    if (key.contains("/cast/stream.mp4", ignoreCase = true) ||
+                    if (key.contains("/cast/stream", ignoreCase = true) ||
                         key.contains("127.0.0.1", ignoreCase = true)
                     ) {
                         try {
@@ -1753,21 +1761,32 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val currentJsonText = getConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                 getConn.disconnect()
 
-                val setsObj = JSONObject(currentJsonText)
+                val rootObj = JSONObject(currentJsonText)
+                val setsObj = rootObj.optJSONObject("sets") ?: rootObj
+
+                fun putCaseInsensitive(target: JSONObject, keyName: String, value: Any) {
+                    val existingKey = target.keys().asSequence().firstOrNull { it.equals(keyName, ignoreCase = true) }
+                    if (existingKey != null) {
+                        target.put(existingKey, value)
+                    } else {
+                        target.put(keyName, value)
+                    }
+                }
+
                 // Use a 64 MB RAM ring buffer (4x 16 MiB pieces) so 67 GiB season packs with 16 MiB pieces
                 // can simultaneously hold the start piece (0) and the end piece (MKV CuesSeekMap) in RAM
                 // without thrashing or triggering native OOM crashes!
-                if (setsObj.has("cacheSize")) setsObj.put("cacheSize", 67_108_864L) // 64 MB RAM ring buffer
-                if (setsObj.has("readerReadAHead")) setsObj.put("readerReadAHead", 70) // 70% ahead (~45 MB), 30% (~19 MB > 16 MiB piece) behind cursor
-                if (setsObj.has("readerReadAhead")) setsObj.put("readerReadAhead", 70)
-                if (setsObj.has("preloadCache")) setsObj.put("preloadCache", 0) // Instant stream start (no preload reset)
-                if (setsObj.has("connectionsLimit")) setsObj.put("connectionsLimit", 45) // Fast piece acquisition for instant seeking
-                if (setsObj.has("useDisk")) setsObj.put("useDisk", false) // Pure RAM streaming
-                if (setsObj.has("enableDLNA")) setsObj.put("enableDLNA", false)
-                if (setsObj.has("enableDebug")) setsObj.put("enableDebug", false)
-                if (setsObj.has("enableRutorSearch")) setsObj.put("enableRutorSearch", false)
-                if (setsObj.has("retrackersMode")) setsObj.put("retrackersMode", 0) // Never inject public trackers into private torrents
-                if (setsObj.has("torrentDisconnectTimeout")) setsObj.put("torrentDisconnectTimeout", 300)
+                putCaseInsensitive(setsObj, "cacheSize", 67_108_864L) // 64 MB RAM ring buffer
+                putCaseInsensitive(setsObj, "readerReadAHead", 70) // 70% ahead (~45 MB), 30% (~19 MB > 16 MiB piece) behind cursor
+                putCaseInsensitive(setsObj, "preloadCache", 0) // Instant stream start (no preload reset)
+                putCaseInsensitive(setsObj, "preloadBuffer", false) // Never block HTTP response waiting for preload buffer
+                putCaseInsensitive(setsObj, "connectionsLimit", 50) // Fast piece acquisition for instant timeline seeking
+                putCaseInsensitive(setsObj, "useDisk", false) // Pure RAM streaming
+                putCaseInsensitive(setsObj, "enableDLNA", false)
+                putCaseInsensitive(setsObj, "enableDebug", false)
+                putCaseInsensitive(setsObj, "enableRutorSearch", false)
+                putCaseInsensitive(setsObj, "retrackersMode", 0) // Never inject public trackers into private torrents
+                putCaseInsensitive(setsObj, "torrentDisconnectTimeout", 600)
 
                 val payload = JSONObject().apply {
                     put("action", "set")
@@ -2673,6 +2692,26 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                 val clientRangeHeader = requestHeaders["range"]
                 val ua = requestHeaders["user-agent"].orEmpty()
+                // CRITICAL: CloudStream's `Mp4PreviewGenerator` launches Android's native `MediaMetadataRetriever`
+                // (`stagefright`) on every `ExtractorLinkType.VIDEO` URL and executes 63 concurrent random-access
+                // `getFrameAtTime` seeks across the entire movie (50%, 25%, 75%, 12.5%, etc.).
+                // If `stagefright` is redirected to TorrServer, those 63 random-seek readers thrash TorrServer's
+                // 64 MB RAM ring buffer and starve `UpdatedMatroskaExtractor`'s Cues seek and timeline scrubbing!
+                // Returning 403 Forbidden aborts `Mp4PreviewGenerator` in <1ms so it never touches TorrServer.
+                if (ua.contains("stagefright", ignoreCase = true) ||
+                    ua.contains("MediaMetadataRetriever", ignoreCase = true)
+                ) {
+                    val out = BufferedOutputStream(sock.getOutputStream(), 1024)
+                    val forbidHeaders = buildString {
+                        append("HTTP/1.1 403 Forbidden\r\n")
+                        append("Content-Length: 0\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(forbidHeaders.toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    return
+                }
+
                 val isExternalLanClient = try {
                     val remoteAddr = sock.inetAddress
                     val localAddr = sock.localAddress
@@ -2694,9 +2733,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     ua.contains("Lavf", ignoreCase = true) ||
                     ua.contains("ExoPlayer", ignoreCase = true) ||
                     ua.contains("MediaPlayer", ignoreCase = true) ||
-                    ua.contains("mpv", ignoreCase = true) ||
-                    ua.contains("stagefright", ignoreCase = true) ||
-                    ua.contains("Dalvik", ignoreCase = true)
+                    ua.contains("mpv", ignoreCase = true)
                 val isCastReceiverUA = ua.contains("CrKey", ignoreCase = true) ||
                     ua.contains("Chromecast", ignoreCase = true) ||
                     ua.contains("Cast", ignoreCase = true) ||
@@ -4767,8 +4804,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         /**
-         * `/sub` CORS Subtitle Proxy Route so Chromecast (`castSession`) can load OpenSubtitles
-         * tracks with `Access-Control-Allow-Origin: *`.
+         * `/sub` CORS Subtitle Proxy Route so Chromecast (`castSession`) and ExoPlayer can load
+         * OpenSubtitles tracks with `Access-Control-Allow-Origin: *`, in-memory caching, and
+         * non-blocking empty-SRT fallback (preventing `SingleSampleMediaPeriod` 502 retry stalls
+         * inside `MergingMediaPeriod`).
          */
         private fun handleProxySubtitle(sock: Socket, method: String, rawQuery: String) {
             var subUrl = ""
@@ -4784,29 +4823,44 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 return
             }
 
+            subtitleResponseCache[subUrl]?.let { cached ->
+                sendHttpResponse(sock, 200, cached.first, cached.second)
+                return
+            }
+
+            val fallbackType = if (subUrl.endsWith(".vtt", ignoreCase = true)) {
+                "text/vtt; charset=utf-8"
+            } else {
+                "application/x-subrip; charset=utf-8"
+            }
+            val fallbackBody = if (subUrl.endsWith(".vtt", ignoreCase = true)) {
+                "WEBVTT\n\n".toByteArray(Charsets.UTF_8)
+            } else {
+                ByteArray(0)
+            }
+
             try {
                 val conn = (URL(subUrl).openConnection() as HttpURLConnection).apply {
                     instanceFollowRedirects = true
                     requestMethod = "GET"
                     setRequestProperty("User-Agent", USER_AGENT)
-                    connectTimeout = 8000
-                    readTimeout = 8000
+                    connectTimeout = 3500
+                    readTimeout = 3500
                 }
                 if (conn.responseCode in 200..299) {
                     val bytes = conn.inputStream.use { readAllBytes(it) }
                     conn.disconnect()
-                    val contentType = if (subUrl.endsWith(".vtt", ignoreCase = true)) {
-                        "text/vtt; charset=utf-8"
-                    } else {
-                        "application/x-subrip; charset=utf-8"
+                    if (subtitleResponseCache.size > 40) {
+                        subtitleResponseCache.clear()
                     }
-                    sendHttpResponse(sock, 200, contentType, bytes)
+                    subtitleResponseCache[subUrl] = Pair(fallbackType, bytes)
+                    sendHttpResponse(sock, 200, fallbackType, bytes)
                 } else {
                     conn.disconnect()
-                    sendHttpResponse(sock, 502, "text/plain", "Failed to load subtitle".toByteArray())
+                    sendHttpResponse(sock, 200, fallbackType, fallbackBody)
                 }
             } catch (_: Exception) {
-                sendHttpResponse(sock, 502, "text/plain", "Subtitle proxy error".toByteArray())
+                sendHttpResponse(sock, 200, fallbackType, fallbackBody)
             }
         }
 
@@ -5534,7 +5588,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val subUrl = sub.url?.trim()?.takeIf { it.startsWith("http") } ?: continue
                 val langDisplay = targetLangs[code] ?: continue
                 val seen = countByLang[langDisplay] ?: 0
-                if (seen >= 3) continue
+                if (seen >= 1) continue
                 countByLang[langDisplay] = seen + 1
                 val suffix = if (seen > 0) " #${seen + 1}" else ""
                 val proxiedSubUrl = if (localPort > 0) {
@@ -7095,8 +7149,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
 
                     val castFlag = if (castingNow) "1" else "0"
+                    val isMkvFile = parsedMeta?.files?.getOrNull(exactFileIndex - 1)?.first?.endsWith(".mkv", ignoreCase = true)
+                        ?: !stream.name.contains(".mp4", ignoreCase = true)
+                    val streamExt = if (castingNow || !isMkvFile) "mp4" else "mkv"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.mp4?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=32"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=33"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -7156,18 +7213,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
      * 1. Bypasses `CronetDataSource` (which has a hard 15s `setReadTimeoutMs(15000)` that throws
      *    `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT (2002)` during torrent piece waits) and uses
      *    `OkHttpDataSource` instead.
-     * 2. Directly rewrites `/cast/stream.mp4` requests from local ExoPlayer to TorrServer's native
+     * 2. Directly rewrites `/cast/stream.(mkv|mp4)` requests from local ExoPlayer to TorrServer's native
      *    Go `http.ServeContent` URL (`http://127.0.0.1:<torrPort>/stream/<fname>?link=<hash>&index=<id>&play`)
-     *    with `Connection: close`. This ensures:
-     *    - Zero intermediate TCP socket proxy between ExoPlayer and TorrServer.
-     *    - When `UpdatedMatroskaExtractor` closes its initial `bytes=0-` stream to seek to the EOF
-     *      `Cues` index, or when the user drags the timeline seekbar / taps "Skip Intro", OkHttp
-     *      immediately closes the TCP socket (`Connection: close`) instead of calling `Util.skipAll`
-     *      to drain gigabytes of remaining video bytes, and TorrServer's Go HTTP engine immediately
-     *      receives the TCP FIN (`r.Context().Done()`) and cancels the abandoned BitTorrent piece reader.
-     *    - If TorrServer ever evicts the torrent from RAM (returning HTTP 404/410), the interceptor
-     *      transparently re-adds the torrent via the Ghost Ratio Proxy and retries the exact `Range`
-     *      request seamlessly.
+     *    with `CacheControl.FORCE_NETWORK` (bypassing `app.baseClient`'s 50 MB disk `http_cache`).
+     * 3. Keeps localhost HTTP keep-alive enabled so `CacheDataSource`'s 5 MB sequential spans reuse the
+     *    TorrServer socket cleanly while range seeks (>100ms remaining) automatically close the old stream.
      */
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
@@ -7178,7 +7228,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             var activeReq = req
             var castQueryForRetry: String? = null
 
-            if (urlStr.contains("/cast/stream.mp4")) {
+            if (urlStr.contains("/cast/stream")) {
                 val rawQuery = req.url.encodedQuery.orEmpty()
                 castQueryForRetry = rawQuery
                 if (req.url.queryParameter("cast") != "1") {
@@ -7192,14 +7242,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     if (!directTorrUrl.isNullOrBlank()) {
                         activeReq = req.newBuilder()
                             .url(directTorrUrl)
-                            .header("Connection", "close")
+                            .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                            .header("Cache-Control", "no-store")
                             .build()
                     }
                 }
             } else if (urlStr.contains("/stream/")) {
                 castQueryForRetry = torrUrlToCastQueryMap[urlStr]
                 activeReq = req.newBuilder()
-                    .header("Connection", "close")
+                    .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                    .header("Cache-Control", "no-store")
                     .build()
             }
 
@@ -7209,7 +7261,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 .withWriteTimeout(45, TimeUnit.SECONDS)
 
             val response = timedChain.proceed(activeReq)
-            if ((response.code == 404 || response.code == 410) && !castQueryForRetry.isNullOrBlank()) {
+            if ((response.code == 404 || response.code == 410 || response.code >= 500) && !castQueryForRetry.isNullOrBlank()) {
                 val localPort = ensureLocalProxyServer()
                 val refreshedTarget = resolveDirectTorrStreamFromCastQuery(
                     rawQuery = castQueryForRetry,
@@ -7224,7 +7276,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                     val retryReq = req.newBuilder()
                         .url(refreshedTorrUrl)
-                        .header("Connection", "close")
+                        .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                        .header("Cache-Control", "no-store")
                         .build()
                     return@Interceptor timedChain.proceed(retryReq)
                 }
