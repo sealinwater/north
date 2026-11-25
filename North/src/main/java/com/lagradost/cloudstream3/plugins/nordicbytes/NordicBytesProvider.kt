@@ -623,22 +623,52 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         @Volatile
         private var isCastProgressThreadRunning: Boolean = false
 
-        private data class TranscodedCastStreamContext(
-            val ebmlHeaderBody: ByteArray,
-            val infoBody: ByteArray?,
+        private class ByteExactMkvContext(
+            val patchedHeaderBytes: ByteArray,
+            val firstClusterOffset: Long,
+            val totalFileBytes: Long,
             val timecodeScaleNs: Long,
             val videoTracks: List<MkvTrackInfo>,
             val chosenAudio: MkvTrackInfo,
-            val durationMs: Double,
-            val totalFileBytes: Long,
-            val firstClusterOffset: Long
-        )
+            val durationMs: Double
+        ) {
+            private val cacheLock = Any()
+            private val maxCacheBytes = 4 * 1024 * 1024
+            private var currentCacheBytes = 0
+            private val recentClusters = LinkedHashMap<Long, ByteArray>(16, 0.75f, true)
+
+            fun putCluster(clusterFileOffset: Long, bytes: ByteArray) {
+                if (bytes.isEmpty() || bytes.size > maxCacheBytes) return
+                synchronized(cacheLock) {
+                    val prev = recentClusters.put(clusterFileOffset, bytes)
+                    if (prev != null) currentCacheBytes -= prev.size
+                    currentCacheBytes += bytes.size
+                    val it = recentClusters.entries.iterator()
+                    while (currentCacheBytes > maxCacheBytes && it.hasNext()) {
+                        val evicted = it.next()
+                        currentCacheBytes -= evicted.value.size
+                        it.remove()
+                    }
+                }
+            }
+
+            fun findClusterContaining(byteOffset: Long): Pair<Long, ByteArray>? {
+                synchronized(cacheLock) {
+                    for ((startOff, data) in recentClusters) {
+                        if (byteOffset >= startOff && byteOffset < startOff + data.size.toLong()) {
+                            return Pair(startOff, data)
+                        }
+                    }
+                    return null
+                }
+            }
+        }
 
         private val proxyLock = Any()
         private val torrResolveLock = Any()
         private val introDownloadLock = Any()
         private val transcodedStreamUrls = ConcurrentHashMap<String, Boolean>()
-        private val transcodedStreamContextMap = ConcurrentHashMap<String, TranscodedCastStreamContext>()
+        private val transcodedStreamContextMap = ConcurrentHashMap<String, ByteExactMkvContext>()
         private val mkvCuesTailCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
         private val mkvCuesTailWarmInProgress = ConcurrentHashMap<String, Boolean>()
         private val torrUrlToCastQueryMap = ConcurrentHashMap<String, String>()
@@ -2910,16 +2940,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 var requestedStartOffset = 0L
                 var requestedEndInclusive = -1L
                 if (!clientRangeHeader.isNullOrBlank() && clientRangeHeader.startsWith("bytes=")) {
-                    val spec = clientRangeHeader.removePrefix("bytes=")
+                    val spec = clientRangeHeader.removePrefix("bytes=").substringBefore(",")
                     requestedStartOffset = spec.substringBefore("-").trim().toLongOrNull() ?: 0L
                     requestedEndInclusive = spec.substringAfter("-", "").trim().toLongOrNull() ?: -1L
                 }
 
-                // Allow Chromecast & Google TV to seek freely across the timeline!
-                // Even if the stream is a live-transcoded 5.1 MKV, we pass `clientRangeHeader` (`bytes=startOffset-`)
-                // to TorrServer and prepend the cached Matroska EBML/Segment/Info/Tracks header before resynchronizing
-                // to the nearest Matroska Cluster (`0x1F43B675`) at the target byte offset!
-                val forceTranscodedRestartFromZero = false
+                val cleanTitle = displayName.replace("\"", "").replace("\r", "").replace("\n", "").ifBlank { "North Stream" }
 
                 fun openTorrConnection(streamUrl: String, rangeHeaderValue: String?, readTimeoutMs: Int): HttpURLConnection {
                     return (URL(streamUrl).openConnection() as HttpURLConnection).apply {
@@ -2934,7 +2960,187 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                 }
 
-                val cleanTitle = displayName.replace("\"", "").replace("\r", "").replace("\n", "").ifBlank { "North Stream" }
+                // Helper to open a resumable TorrServer stream at any exact byte offset for Byte-Exact Cast requests
+                fun openResumableTorrStreamAtOffset(offset: Long): BufferedInputStream? {
+                    val readTimeoutMs = if (offset > 0L) 60000 else 30000
+                    val rangeVal = "bytes=$offset-"
+                    var conn = openTorrConnection(torrStreamUrl, rangeVal, readTimeoutMs)
+                    var respCode = try {
+                        conn.responseCode
+                    } catch (_: Exception) {
+                        -1
+                    }
+                    if (respCode !in 200..299 && respCode != 416) {
+                        try {
+                            conn.disconnect()
+                        } catch (_: Exception) {
+                        }
+                        val refreshed = resolveTorrServerStreamUrl(
+                            localTorrentUrl,
+                            magnetFallbackUrl,
+                            exactIndex,
+                            forceReAdd = (respCode == 404 || respCode == 410),
+                            seasonNum = targetSeason,
+                            epNum = targetEpisode
+                        ) ?: return null
+                        torrStreamUrl = refreshed
+                        conn = openTorrConnection(torrStreamUrl, rangeVal, readTimeoutMs)
+                        respCode = try {
+                            conn.responseCode
+                        } catch (_: Exception) {
+                            -1
+                        }
+                    }
+                    if (respCode !in 200..299) {
+                        try {
+                            conn.disconnect()
+                        } catch (_: Exception) {
+                        }
+                        return null
+                    }
+                    upstreamConn = conn
+                    val expectedLen = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+                    val resumable = object : InputStream() {
+                        private var currentStream: InputStream? = try {
+                            conn.inputStream
+                        } catch (_: Exception) {
+                            null
+                        }
+                        private var totalRead = 0L
+                        private var resumeCount = 0
+
+                        override fun read(): Int {
+                            val b = ByteArray(1)
+                            val n = read(b, 0, 1)
+                            return if (n == 1) (b[0].toInt() and 0xFF) else -1
+                        }
+
+                        override fun read(b: ByteArray, off: Int, len: Int): Int {
+                            if (len == 0) return 0
+                            while (true) {
+                                if (sock.isClosed) return -1
+                                val s = currentStream
+                                if (s != null) {
+                                    try {
+                                        val n = s.read(b, off, len)
+                                        if (n > 0) {
+                                            totalRead += n
+                                            lastKeepAliveTouchMs = System.currentTimeMillis()
+                                            resumeCount = 0
+                                            return n
+                                        }
+                                        if (n == -1 && (expectedLen <= 0L || totalRead >= expectedLen)) {
+                                            return -1
+                                        }
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                                if (sock.isClosed) return -1
+                                if (expectedLen in 1L..totalRead) return -1
+                                if (resumeCount >= 6) return -1
+                                resumeCount++
+                                try {
+                                    currentStream?.close()
+                                } catch (_: Exception) {
+                                }
+                                try {
+                                    upstreamConn?.disconnect()
+                                } catch (_: Exception) {
+                                }
+                                try {
+                                    Thread.sleep(400L * resumeCount.coerceAtMost(4))
+                                } catch (_: Exception) {
+                                }
+                                if (sock.isClosed) return -1
+                                val nextOff = offset + totalRead
+                                val nextConn = openTorrConnection(torrStreamUrl, "bytes=$nextOff-", 90000)
+                                upstreamConn = nextConn
+                                val rCode = try {
+                                    nextConn.responseCode
+                                } catch (_: Exception) {
+                                    -1
+                                }
+                                if (rCode !in 200..299) return -1
+                                currentStream = try {
+                                    nextConn.inputStream
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                        }
+
+                        override fun close() {
+                            try {
+                                currentStream?.close()
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    return BufferedInputStream(resumable, 32_768)
+                }
+
+                // Fast-path for Chromecast requests when we already built a Byte-Exact Matroska Context!
+                // Serves header slices & cached recent Clusters directly from RAM (0ms latency) and handles
+                // EOF Cues reads, Cues timeline seeks, and mid-cluster resyncs with strict RFC 7233 headers.
+                val existingByteExactCtx = transcodedStreamContextMap[torrStreamUrl]
+                if (isChromecastRequest && existingByteExactCtx != null) {
+                    val out = BufferedOutputStream(sock.getOutputStream(), 32768)
+                    if (method == "HEAD") {
+                        val headHeaders = buildString {
+                            append("HTTP/1.1 200 OK\r\n")
+                            append("Content-Type: video/mp4\r\n")
+                            append("icy-name: $cleanTitle\r\n")
+                            append("Content-Disposition: inline; filename=\"$cleanTitle.mp4\"\r\n")
+                            append("Accept-Ranges: bytes\r\n")
+                            append("Content-Length: ${existingByteExactCtx.totalFileBytes}\r\n")
+                            append("Access-Control-Allow-Origin: *\r\n")
+                            append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+                            append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                            append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+                            append("Connection: close\r\n\r\n")
+                        }
+                        out.write(headHeaders.toByteArray(Charsets.US_ASCII))
+                        out.flush()
+                        return
+                    }
+                    serveByteExactMatroskaFromContext(
+                        ctx = existingByteExactCtx,
+                        out = out,
+                        streamTitle = cleanTitle,
+                        clientHasRange = !clientRangeHeader.isNullOrBlank(),
+                        requestedStartOffset = requestedStartOffset,
+                        requestedEndInclusive = requestedEndInclusive,
+                        openUpstreamAtOffset = ::openResumableTorrStreamAtOffset
+                    )
+                    return
+                }
+
+                // Streaming-fallback streams (rare MKVs with indeterminate Segment/Cluster sizes or no AAC encoder):
+                // fall back to v34's proven 200 OK + Accept-Ranges: none streaming mode from byte 0.
+                val isStreamingFallbackStream = isChromecastRequest &&
+                    transcodedStreamUrls[torrStreamUrl] == true &&
+                    existingByteExactCtx == null
+
+                if (isStreamingFallbackStream && method == "HEAD") {
+                    val out = BufferedOutputStream(sock.getOutputStream(), 4096)
+                    val headHeaders = buildString {
+                        append("HTTP/1.1 200 OK\r\n")
+                        append("Content-Type: video/mp4\r\n")
+                        append("icy-name: $cleanTitle\r\n")
+                        append("Content-Disposition: inline; filename=\"$cleanTitle.mp4\"\r\n")
+                        append("Accept-Ranges: none\r\n")
+                        append("Access-Control-Allow-Origin: *\r\n")
+                        append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+                        append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                        append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(headHeaders.toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    return
+                }
+
+                val forceTranscodedRestartFromZero = isStreamingFallbackStream && requestedStartOffset > 0L
 
                 // Fast-path: Serve Matroska Cues / EOF tail seek requests directly from RAM if already cached
                 if (!isChromecastRequest && method != "HEAD" && requestedStartOffset > 0L) {
@@ -2979,12 +3185,15 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                 // Allow generous read timeout on forward/EOF seek requests (including 16 MiB season-pack pieces)
                 val initialReadTimeout = if (requestedStartOffset > 0L) 60000 else 30000
-                // Ensure Range requests always receive HTTP 206 Partial Content with Content-Range from TorrServer
-                // unless this is a live-transcoded Chromecast stream where we must stream sequentially from byte 0.
-                val effectiveUpstreamRange = if (forceTranscodedRestartFromZero) {
-                    null
-                } else {
-                    clientRangeHeader ?: if (!isChromecastRequest) "bytes=0-" else null
+                // When Chromecast requests offset 0 for an uninspected stream, open TorrServer with open-ended
+                // `bytes=0-` so we can read the full Matroska header up to `firstClusterOffset` even if the client
+                // sent a small probe like `Range: bytes=0-32767` (we still strictly cap output at `requestedEndInclusive`).
+                val openedOpenEndedAtZero = isChromecastRequest && method != "HEAD" &&
+                    (requestedStartOffset == 0L || forceTranscodedRestartFromZero)
+                val effectiveUpstreamRange = when {
+                    forceTranscodedRestartFromZero -> null
+                    openedOpenEndedAtZero -> "bytes=0-"
+                    else -> clientRangeHeader ?: if (!isChromecastRequest) "bytes=0-" else null
                 }
                 upstreamConn = openTorrConnection(torrStreamUrl, effectiveUpstreamRange, initialReadTimeout)
                 var code = try {
@@ -3018,7 +3227,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val acceptRanges = upstreamConn.getHeaderField("Accept-Ranges") ?: "bytes"
 
                 val expectedBytes = contentLength?.toLongOrNull() ?: -1L
-                var startByteOffset = requestedStartOffset
+                var startByteOffset = if (forceTranscodedRestartFromZero) 0L else requestedStartOffset
                 var endByteInclusive = requestedEndInclusive
                 var totalFileBytes = -1L
                 if (!contentRange.isNullOrBlank() && contentRange.startsWith("bytes ")) {
@@ -3036,18 +3245,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                 }
 
-                // If client did not send a Range header (or we forced a live-transcode restart from 0),
+                // If client did not send a Range header (or we forced a streaming-fallback restart from 0),
                 // normalize status to 200 OK and omit Content-Range.
                 if ((clientRangeHeader.isNullOrBlank() || forceTranscodedRestartFromZero) && code == 206 && startByteOffset == 0L) {
                     code = 200
                     contentRange = null
-                }
-
-                val statusText = when (code) {
-                    200 -> "OK"
-                    206 -> "Partial Content"
-                    416 -> "Requested Range Not Satisfiable"
-                    else -> upstreamConn.responseMessage ?: "OK"
                 }
 
                 val out = BufferedOutputStream(sock.getOutputStream(), 32768)
@@ -3184,59 +3386,72 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                 var preReadBytes: ByteArray? = null
                 var detectedMkvStream = false
-                // Inspect Chromecast streams at offset 0 (to parse EBML/Tracks and determine whether live
-                // surround-to-stereo Matroska audio transcoding is needed) AND at sought byte offsets > 0
-                // when a cached TranscodedCastStreamContext exists for this stream!
-                if (isChromecastRequest && method != "HEAD" && code in 200..299) {
-                    if (startByteOffset == 0L) {
-                        val peek4 = ByteArray(4)
-                        var readCount = 0
-                        while (readCount < 4) {
-                            val r = bufferedUpstream.read(peek4, readCount, 4 - readCount)
-                            if (r <= 0) break
-                            readCount += r
-                        }
-                        val initialBytes = if (readCount == 4) peek4 else peek4.copyOf(readCount)
-                        val isMkv = initialBytes.size == 4 &&
-                            initialBytes[0] == 0x1A.toByte() &&
-                            initialBytes[1] == 0x45.toByte() &&
-                            initialBytes[2] == 0xDF.toByte() &&
-                            initialBytes[3] == 0xA3.toByte()
-                        detectedMkvStream = isMkv
+                // Inspect Chromecast streams at offset 0 to parse EBML/Tracks and decide between:
+                // 1) 100% raw passthrough (AAC/Opus/Vorbis/MP3/FLAC - 2.0 OR 5.1)
+                // 2) Byte-Exact EBML Void-Padded 128 kbps AAC transcoding (full Cues + timeline seeking!)
+                // 3) Streaming fallback (edge-case MKVs with unknown Segment/Cluster size or no AAC encoder)
+                if (isChromecastRequest && method != "HEAD" && code in 200..299 && startByteOffset == 0L) {
+                    val peek4 = ByteArray(4)
+                    var readCount = 0
+                    while (readCount < 4) {
+                        val r = bufferedUpstream.read(peek4, readCount, 4 - readCount)
+                        if (r <= 0) break
+                        readCount += r
+                    }
+                    val initialBytes = if (readCount == 4) peek4 else peek4.copyOf(readCount)
+                    val isMkv = initialBytes.size == 4 &&
+                        initialBytes[0] == 0x1A.toByte() &&
+                        initialBytes[1] == 0x45.toByte() &&
+                        initialBytes[2] == 0xDF.toByte() &&
+                        initialBytes[3] == 0xA3.toByte()
+                    detectedMkvStream = isMkv
 
-                        if (isMkv) {
-                            val handledByTranscoder = streamMatroskaWithChromecastAudio(
-                                initialPrefix = initialBytes,
-                                upstream = bufferedUpstream,
-                                out = out,
-                                streamKey = torrStreamUrl,
-                                streamTitle = cleanTitle,
-                                totalFileBytes = totalFileBytes,
-                                requestedStartOffset = 0L,
-                                requestedEndInclusive = endByteInclusive
-                            )
-                            if (handledByTranscoder.first) {
-                                return
-                            }
-                            preReadBytes = handledByTranscoder.second ?: initialBytes
-                        } else {
-                            preReadBytes = initialBytes
-                        }
-                    } else if (transcodedStreamContextMap.containsKey(torrStreamUrl)) {
-                        detectedMkvStream = true
-                        val handledSeek = streamMatroskaWithChromecastAudioFromSeekOffset(
+                    if (isMkv) {
+                        val handledByTranscoder = streamMatroskaWithChromecastAudio(
+                            initialPrefix = initialBytes,
                             upstream = bufferedUpstream,
                             out = out,
                             streamKey = torrStreamUrl,
                             streamTitle = cleanTitle,
                             totalFileBytes = totalFileBytes,
-                            requestedStartOffset = startByteOffset,
-                            requestedEndInclusive = endByteInclusive
+                            clientHasRange = !clientRangeHeader.isNullOrBlank(),
+                            requestedEndInclusive = requestedEndInclusive
                         )
-                        if (handledSeek) {
+                        if (handledByTranscoder.first) {
                             return
                         }
+                        preReadBytes = handledByTranscoder.second ?: initialBytes
+                    } else {
+                        preReadBytes = initialBytes
                     }
+                }
+
+                // If we opened TorrServer open-ended (`bytes=0-`) for a Chromecast probe like `bytes=0-32767`
+                // and it turned out to be raw passthrough, enforce the client's exact requested end byte!
+                var passthroughMaxBytes = -1L
+                var outContentLengthStr = contentLength
+                if (openedOpenEndedAtZero && !clientRangeHeader.isNullOrBlank() && totalFileBytes > 0L) {
+                    val safeEnd = if (requestedEndInclusive in 0L until totalFileBytes) {
+                        requestedEndInclusive
+                    } else {
+                        totalFileBytes - 1L
+                    }
+                    passthroughMaxBytes = safeEnd + 1L
+                    code = 206
+                    contentRange = "bytes 0-$safeEnd/$totalFileBytes"
+                    outContentLengthStr = passthroughMaxBytes.toString()
+                } else if (openedOpenEndedAtZero && clientRangeHeader.isNullOrBlank() && totalFileBytes > 0L) {
+                    passthroughMaxBytes = totalFileBytes
+                    code = 200
+                    contentRange = null
+                    outContentLengthStr = totalFileBytes.toString()
+                }
+
+                val statusText = when (code) {
+                    200 -> "OK"
+                    206 -> "Partial Content"
+                    416 -> "Requested Range Not Satisfiable"
+                    else -> upstreamConn.responseMessage ?: "OK"
                 }
 
                 val isMkvContent = detectedMkvStream ||
@@ -3252,8 +3467,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     append("icy-name: $cleanTitle\r\n")
                     append("Content-Disposition: inline; filename=\"$cleanTitle.$outExt\"\r\n")
                     append("Accept-Ranges: $outAcceptRanges\r\n")
-                    if (!contentLength.isNullOrBlank()) {
-                        append("Content-Length: $contentLength\r\n")
+                    if (!outContentLengthStr.isNullOrBlank()) {
+                        append("Content-Length: $outContentLengthStr\r\n")
                     }
                     if (!contentRange.isNullOrBlank() && code == 206) {
                         append("Content-Range: $contentRange\r\n")
@@ -3268,9 +3483,18 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 out.flush()
 
                 if (method != "HEAD" && code in 200..299) {
+                    var remainingToEmit = passthroughMaxBytes
                     if (preReadBytes != null && preReadBytes.isNotEmpty()) {
-                        out.write(preReadBytes)
-                        out.flush()
+                        val toWrite = if (remainingToEmit >= 0L) {
+                            min(preReadBytes.size.toLong(), remainingToEmit).toInt()
+                        } else {
+                            preReadBytes.size
+                        }
+                        if (toWrite > 0) {
+                            out.write(preReadBytes, 0, toWrite)
+                            out.flush()
+                            if (remainingToEmit >= 0L) remainingToEmit -= toWrite
+                        }
                     }
                     val shouldCaptureTailForCache = !isChromecastRequest &&
                         startByteOffset > 1_048_576L &&
@@ -3282,13 +3506,18 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     var inspectedFirstChunkHeader = false
 
                     val buf = ByteArray(32768)
-                    var n: Int
-                    while (bufferedUpstream.read(buf).also { n = it } != -1) {
+                    var n = 0
+                    while ((remainingToEmit < 0L || remainingToEmit > 0L) &&
+                        bufferedUpstream.read(
+                            buf,
+                            0,
+                            if (remainingToEmit >= 0L) min(buf.size.toLong(), remainingToEmit).toInt() else buf.size
+                        ).also { n = it } != -1
+                    ) {
                         try {
                             out.write(buf, 0, n)
-                            // Flush every chunk immediately so UpdatedMatroskaExtractor receives the 6.5 KB
-                            // MKV header, the 35-60 KB Cues table, and seek Clusters without waiting for 64 KB!
                             out.flush()
+                            if (remainingToEmit >= 0L) remainingToEmit -= n
                             if (!inspectedFirstChunkHeader && !isChromecastRequest && startByteOffset == 0L) {
                                 inspectedFirstChunkHeader = true
                                 if (n >= 64 && !mkvCuesTailCache.containsKey(torrStreamUrl)) {
@@ -3439,7 +3668,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         private fun isChromecastSafeDirectAudio(track: MkvTrackInfo): Boolean {
-            if (track.channels > 2) return false // 5.1/7.1 surround tracks must be downmixed to 2.0 stereo for TVs
+            // Chromecast & Google TV natively decode and downmix AAC, Opus, Vorbis, MP3, MP2, PCM, and FLAC
+            // (both 2.0 stereo AND 5.1/7.1 surround) in hardware! Allow direct byte-exact passthrough for all
+            // native codecs so only unsupported codecs (AC3, EAC3, DTS, TrueHD, MLP) need live transcoding.
             val cid = track.codecId.uppercase(Locale.ROOT)
             return cid.startsWith("A_AAC") ||
                 cid == "A_MPEG/L3" ||
@@ -3457,6 +3688,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             private var prefixPos = 0
             var recordPassthrough = true
             val passthroughBuffer = ByteArrayOutputStream(131072)
+            var totalBytesRead: Long = 0L
+                private set
 
             fun readByte(): Int {
                 val v = if (prefixPos < prefix.size) {
@@ -3464,10 +3697,36 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 } else {
                     upstream.read()
                 }
-                if (v >= 0 && recordPassthrough) {
-                    passthroughBuffer.write(v)
+                if (v >= 0) {
+                    totalBytesRead++
+                    if (recordPassthrough) {
+                        passthroughBuffer.write(v)
+                    }
                 }
                 return v
+            }
+
+            fun readChunk(dst: ByteArray, maxLen: Int): Int {
+                if (maxLen <= 0) return 0
+                val fromPrefix = prefix.size - prefixPos
+                if (fromPrefix > 0) {
+                    val toCopy = min(maxLen, fromPrefix)
+                    System.arraycopy(prefix, prefixPos, dst, 0, toCopy)
+                    if (recordPassthrough) {
+                        passthroughBuffer.write(prefix, prefixPos, toCopy)
+                    }
+                    prefixPos += toCopy
+                    totalBytesRead += toCopy
+                    return toCopy
+                }
+                val n = upstream.read(dst, 0, min(maxLen, dst.size))
+                if (n > 0) {
+                    totalBytesRead += n
+                    if (recordPassthrough) {
+                        passthroughBuffer.write(dst, 0, n)
+                    }
+                }
+                return n
             }
 
             fun readExact(len: Int): ByteArray? {
@@ -3483,6 +3742,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             passthroughBuffer.write(prefix, prefixPos, toCopy)
                         }
                         prefixPos += toCopy
+                        totalBytesRead += toCopy
                         off += toCopy
                     } else {
                         val n = upstream.read(out, off, len - off)
@@ -3490,6 +3750,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         if (recordPassthrough) {
                             passthroughBuffer.write(out, off, n)
                         }
+                        totalBytesRead += n
                         off += n
                     }
                 }
@@ -3511,6 +3772,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
              * Reads an EBML Element ID (keeping the VINT length marker bit) and returns Pair(id, bytesRead).
              */
             fun readElementId(): Pair<Long, Int>? {
+                val p = readElementIdWithRaw() ?: return null
+                return Pair(p.first, p.second.size)
+            }
+
+            fun readElementIdWithRaw(): Pair<Long, ByteArray>? {
                 val b0 = readByte()
                 if (b0 < 0) return null
                 val len = when {
@@ -3520,13 +3786,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     (b0 and 0x10) != 0 -> 4
                     else -> return null
                 }
+                val raw = ByteArray(len)
+                raw[0] = b0.toByte()
                 var id = b0.toLong()
                 for (i in 1 until len) {
                     val next = readByte()
                     if (next < 0) return null
+                    raw[i] = next.toByte()
                     id = (id shl 8) or next.toLong()
                 }
-                return Pair(id, len)
+                return Pair(id, raw)
             }
 
             /**
@@ -3534,6 +3803,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
              * Returns Pair(size, bytesRead), where `size = -1L` indicates indeterminate/unknown size.
              */
             fun readElementSize(): Pair<Long, Int>? {
+                val p = readElementSizeWithRaw() ?: return null
+                return Pair(p.first, p.second.size)
+            }
+
+            fun readElementSizeWithRaw(): Pair<Long, ByteArray>? {
                 val b0 = readByte()
                 if (b0 < 0) return null
                 var len = 0
@@ -3546,15 +3820,18 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     mask = mask shr 1
                 }
                 if (len == 0) return null
+                val raw = ByteArray(len)
+                raw[0] = b0.toByte()
                 var value = (b0 and (mask - 1)).toLong()
                 var allOnes = (value == (mask - 1).toLong())
                 for (i in 1 until len) {
                     val next = readByte()
                     if (next < 0) return null
+                    raw[i] = next.toByte()
                     if (next != 0xFF) allOnes = false
                     value = (value shl 8) or next.toLong()
                 }
-                return Pair(if (allOnes) -1L else value, len)
+                return Pair(if (allOnes) -1L else value, raw)
             }
 
             fun drainRemainingPrefixToPassthrough(): ByteArray {
@@ -3681,6 +3958,48 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
         }
 
+        private fun minEbmlSizeVintLen(size: Long): Int {
+            return when {
+                size <= 126L -> 1
+                size <= 16382L -> 2
+                size <= 2097150L -> 3
+                size <= 268435454L -> 4
+                size <= 34359738366L -> 5
+                size <= 4398046511102L -> 6
+                size <= 562949953421310L -> 7
+                else -> 8
+            }
+        }
+
+        private fun writeEbmlSizeWithLength(out: OutputStream, size: Long, vintLen: Int) {
+            val len = vintLen.coerceIn(1, 8)
+            val marker = 1L shl (7 * len)
+            val encoded = marker or size
+            for (shift in (len - 1) * 8 downTo 0 step 8) {
+                out.write(((encoded shr shift) and 0xFFL).toInt())
+            }
+        }
+
+        private fun writeEbmlVoidElement(out: OutputStream, totalVoidBytes: Int) {
+            if (totalVoidBytes < 2) return
+            val (vintLen, payloadLen) = when {
+                totalVoidBytes <= 128 -> 1 to (totalVoidBytes - 2)
+                totalVoidBytes <= 16385 -> 2 to (totalVoidBytes - 3)
+                totalVoidBytes <= 2097154 -> 3 to (totalVoidBytes - 4)
+                totalVoidBytes <= 268435459 -> 4 to (totalVoidBytes - 5)
+                else -> 5 to (totalVoidBytes - 6)
+            }
+            out.write(0xEC) // EBML Void Element ID
+            writeEbmlSizeWithLength(out, payloadLen.toLong(), vintLen)
+            var remaining = payloadLen
+            val zeros = ByteArray(min(remaining, 8192))
+            while (remaining > 0) {
+                val step = min(remaining, zeros.size)
+                out.write(zeros, 0, step)
+                remaining -= step
+            }
+        }
+
         private fun writeEbmlElement(out: OutputStream, id: Long, payload: ByteArray) {
             writeEbmlId(out, id)
             writeEbmlSize(out, payload.size.toLong())
@@ -3699,6 +4018,17 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
             tmp.write((value and 0xFFL).toInt())
             writeEbmlElement(out, id, tmp.toByteArray())
+        }
+
+        private fun writeEbmlFloat32Element(out: OutputStream, id: Long, value: Float) {
+            val bits = java.lang.Float.floatToRawIntBits(value)
+            val b = byteArrayOf(
+                ((bits shr 24) and 0xFF).toByte(),
+                ((bits shr 16) and 0xFF).toByte(),
+                ((bits shr 8) and 0xFF).toByte(),
+                (bits and 0xFF).toByte()
+            )
+            writeEbmlElement(out, id, b)
         }
 
         private fun writeEbmlFloat64Element(out: OutputStream, id: Long, value: Double) {
@@ -3927,20 +4257,23 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private fun buildTranscodedAudioTrackEntry(
             sourceTrack: MkvTrackInfo,
             outSampleRate: Int,
-            useAacCodec: Boolean
+            useAacCodec: Boolean,
+            compact: Boolean = false
         ): ByteArray {
             val entryBody = ByteArrayOutputStream(256)
             writeEbmlUintElement(entryBody, 0xD7L, sourceTrack.trackNumber.toLong())
             writeEbmlUintElement(entryBody, 0x73C5L, sourceTrack.trackUid)
             writeEbmlUintElement(entryBody, 0x83L, 2L) // TrackType = 2 (Audio)
-            writeEbmlUintElement(entryBody, 0xB9L, 1L) // FlagEnabled = 1
-            writeEbmlUintElement(entryBody, 0x88L, 1L) // FlagDefault = 1
-            writeEbmlUintElement(entryBody, 0x55AAL, 0L) // FlagForced = 0
-            writeEbmlUintElement(entryBody, 0x9CL, 0L) // FlagLacing = 0
-            val langStr = sourceTrack.language.ifBlank { "und" }
-            writeEbmlElement(entryBody, 0x22B59CL, langStr.toByteArray(Charsets.US_ASCII))
-            if (sourceTrack.name.isNotBlank()) {
-                writeEbmlElement(entryBody, 0x536EL, sourceTrack.name.toByteArray(Charsets.UTF_8))
+            if (!compact) {
+                writeEbmlUintElement(entryBody, 0xB9L, 1L) // FlagEnabled = 1
+                writeEbmlUintElement(entryBody, 0x88L, 1L) // FlagDefault = 1
+                writeEbmlUintElement(entryBody, 0x55AAL, 0L) // FlagForced = 0
+                writeEbmlUintElement(entryBody, 0x9CL, 0L) // FlagLacing = 0
+                val langStr = sourceTrack.language.ifBlank { "und" }
+                writeEbmlElement(entryBody, 0x22B59CL, langStr.toByteArray(Charsets.US_ASCII))
+                if (sourceTrack.name.isNotBlank()) {
+                    writeEbmlElement(entryBody, 0x536EL, sourceTrack.name.toByteArray(Charsets.UTF_8))
+                }
             }
 
             if (useAacCodec) {
@@ -3951,9 +4284,14 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             val audioSub = ByteArrayOutputStream(32)
-            writeEbmlFloat64Element(audioSub, 0xB5L, outSampleRate.toDouble())
-            writeEbmlUintElement(audioSub, 0x9FL, 2L) // 2.0 Stereo
-            writeEbmlUintElement(audioSub, 0x6264L, 16L) // 16-bit
+            if (compact) {
+                writeEbmlFloat32Element(audioSub, 0xB5L, outSampleRate.toFloat())
+                writeEbmlUintElement(audioSub, 0x9FL, 2L) // 2.0 Stereo
+            } else {
+                writeEbmlFloat64Element(audioSub, 0xB5L, outSampleRate.toDouble())
+                writeEbmlUintElement(audioSub, 0x9FL, 2L) // 2.0 Stereo
+                writeEbmlUintElement(audioSub, 0x6264L, 16L) // 16-bit
+            }
             writeEbmlElement(entryBody, 0xE1L, audioSub.toByteArray())
 
             val fullEntry = ByteArrayOutputStream(entryBody.size() + 8)
@@ -4175,7 +4513,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 try {
                     val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
                     val mf = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, outSampleRate, 2)
-                    mf.setInteger(MediaFormat.KEY_BIT_RATE, 192_000)
+                    mf.setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
                     mf.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                     mf.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
                     enc.configure(mf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -4629,175 +4967,661 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             out.write(frameBytes)
         }
 
-        /**
-         * Scans an arbitrary mid-file Matroska stream (after a byte-range seek) until it locates the next
-         * valid Matroska `Cluster` (`0x1F43B675`) header followed by a `Timecode` (`0xE7`) element, returning
-         * `Pair(clusterSize, initialTimecodeBytes)` so live audio transcoding can resume seamlessly from ANY
-         * timeline seek bar position on Chromecast!
-         */
-        private fun syncToNextMatroskaCluster(upstream: InputStream, maxScanBytes: Int = 4_194_304): ByteArray? {
-            val window = ByteArray(65536)
-            var filled = 0
-            var totalScanned = 0
-            while (totalScanned < maxScanBytes) {
-                val r = upstream.read(window, filled, window.size - filled)
-                if (r <= 0) break
-                filled += r
-                totalScanned += r
-
-                var i = 0
-                val searchLimit = filled - 16
-                while (i <= searchLimit) {
-                    // Look for Cluster ID: 0x1F 0x43 0xB6 0x75
-                    if (window[i] == 0x1F.toByte() &&
-                        window[i + 1] == 0x43.toByte() &&
-                        window[i + 2] == 0xB6.toByte() &&
-                        window[i + 3] == 0x75.toByte()
-                    ) {
-                        val szPair = readEbmlSizeFromArray(window, i + 4, filled)
-                        if (szPair != null) {
-                            val afterClusterHdr = i + 4 + szPair.second
-                            if (afterClusterHdr < filled) {
-                                val nextByte = window[afterClusterHdr].toInt() and 0xFF
-                                // First element inside a valid Matroska Cluster is Timecode (0xE7), Position (0xA7),
-                                // PrevSize (0xAB), SimpleBlock (0xA3), or BlockGroup (0xA0)
-                                if (nextByte == 0xE7 || nextByte == 0xA7 || nextByte == 0xAB || nextByte == 0xA3 || nextByte == 0xA0) {
-                                    return window.copyOfRange(i, filled)
-                                }
-                            }
-                        }
-                    }
-                    i++
+        private fun writeCastHttpResponseHeaders(
+            out: OutputStream,
+            streamTitle: String,
+            clientHasRange: Boolean,
+            startOffset: Long,
+            endInclusive: Long,
+            totalFileBytes: Long
+        ) {
+            val contentLen = (endInclusive - startOffset + 1L).coerceAtLeast(0L)
+            val statusLine = if (clientHasRange) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n"
+            val headers = buildString {
+                append(statusLine)
+                append("Content-Type: video/mp4\r\n")
+                append("icy-name: $streamTitle\r\n")
+                append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
+                append("Accept-Ranges: bytes\r\n")
+                append("Content-Length: $contentLen\r\n")
+                if (clientHasRange) {
+                    append("Content-Range: bytes $startOffset-$endInclusive/$totalFileBytes\r\n")
                 }
-
-                if (filled > 32) {
-                    System.arraycopy(window, filled - 16, window, 0, 16)
-                    filled = 16
-                } else {
-                    filled = 0
-                }
+                append("Access-Control-Allow-Origin: *\r\n")
+                append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+                append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+                append("Connection: close\r\n\r\n")
             }
-            return null
+            out.write(headers.toByteArray(Charsets.US_ASCII))
+            out.flush()
+        }
+
+        private fun buildByteExactPatchedTracksReplacement(
+            origTracksTotalBytes: Int,
+            videoTracks: List<MkvTrackInfo>,
+            chosenAudio: MkvTrackInfo,
+            transcoder: ChromecastAudioTranscoder?
+        ): ByteArray? {
+            fun tryAssemble(compact: Boolean): ByteArray? {
+                val bodyBuf = ByteArrayOutputStream(4096)
+                for (vt in videoTracks) {
+                    bodyBuf.write(vt.rawTrackEntryElement)
+                }
+                if (transcoder != null) {
+                    bodyBuf.write(
+                        buildTranscodedAudioTrackEntry(
+                            sourceTrack = chosenAudio,
+                            outSampleRate = transcoder.outSampleRate,
+                            useAacCodec = transcoder.useAacOutput,
+                            compact = compact
+                        )
+                    )
+                } else {
+                    bodyBuf.write(chosenAudio.rawTrackEntryElement)
+                }
+                val newBody = bodyBuf.toByteArray()
+                val minVintLen = minEbmlSizeVintLen(newBody.size.toLong())
+                val gap = origTracksTotalBytes - (4 + minVintLen + newBody.size)
+                if (gap < 0) return null
+                if (gap == 1 && minVintLen >= 8) return null
+
+                val out = ByteArrayOutputStream(origTracksTotalBytes)
+                writeEbmlId(out, 0x1654AE6BL)
+                if (gap == 1) {
+                    writeEbmlSizeWithLength(out, newBody.size.toLong(), minVintLen + 1)
+                    out.write(newBody)
+                } else {
+                    writeEbmlSizeWithLength(out, newBody.size.toLong(), minVintLen)
+                    out.write(newBody)
+                    if (gap >= 2) {
+                        writeEbmlVoidElement(out, gap)
+                    }
+                }
+                val result = out.toByteArray()
+                return if (result.size == origTracksTotalBytes) result else null
+            }
+
+            return tryAssemble(compact = false) ?: tryAssemble(compact = true)
         }
 
         /**
-         * Handles a mid-stream HTTP Range seek (`requestedStartOffset > 0`) on a live-transcoded Chromecast
-         * Matroska stream by:
-         * 1. Returning `HTTP/1.1 206 Partial Content` with `Accept-Ranges: bytes` and `Content-Range` so
-         *    Chromecast's ExpandedController seekbar and +/- 30s buttons remain active.
-         * 2. If the seek is an EOF probe (`totalFileBytes - requestedStartOffset <= 262_144`), returning
-         *     clean zero-padded/EOF bytes immediately so Chromium's `MultibufferDataSource` completes its
-         *    file-size verification without stalling.
-         * 3. For any timeline seek position, resynchronizing to the nearest Matroska `Cluster` (`0x1F43B675`)
-         *    and streaming transcoded 2.0 Stereo AAC clusters from that exact timestamp onward!
+         * Scans an unaligned mid-Cluster byte stream for the next valid Matroska `Cluster` (`0x1F43B675`)
+         * followed by a valid size VINT and valid Cluster child element ID (`0xE7`/`0xA7`/`0xAB`/`0xA3`/`0xA0`).
+         * Returns `Triple(relativeOffsetToCluster, clusterBytesFromStartOfCluster, rawScannedPrefixIfNotFound)`.
          */
-        private fun streamMatroskaWithChromecastAudioFromSeekOffset(
+        private fun scanForNextMatroskaClusterWithOffset(
+            initialPeek: ByteArray,
             upstream: InputStream,
-            out: OutputStream,
-            streamKey: String,
-            streamTitle: String,
-            totalFileBytes: Long,
-            requestedStartOffset: Long,
-            requestedEndInclusive: Long
-        ): Boolean {
-            val ctx = transcodedStreamContextMap[streamKey] ?: return false
-            val safeTotal = if (totalFileBytes > requestedStartOffset) {
-                totalFileBytes
-            } else if (ctx.totalFileBytes > requestedStartOffset) {
-                ctx.totalFileBytes
-            } else {
-                requestedStartOffset + 104_857_600L
+            maxScanBytes: Long
+        ): Triple<Long, ByteArray?, ByteArray> {
+            val scanLimit = min(maxScanBytes, 4_194_304L).toInt().coerceAtLeast(initialPeek.size)
+            val savedForRawFallback = ByteArrayOutputStream(min(scanLimit, 262_144))
+            val window = ByteArray(65536)
+            var filled = 0
+            var totalRead = 0L
+            var windowStartOffset = 0L
+
+            fun appendToWindow(src: ByteArray, off: Int, len: Int): Pair<Long, ByteArray>? {
+                if (savedForRawFallback.size() < 262_144) {
+                    val toSave = min(len, 262_144 - savedForRawFallback.size())
+                    if (toSave > 0) savedForRawFallback.write(src, off, toSave)
+                }
+                var consumed = 0
+                while (consumed < len) {
+                    val space = window.size - filled
+                    val step = min(space, len - consumed)
+                    System.arraycopy(src, off + consumed, window, filled, step)
+                    filled += step
+                    consumed += step
+                    totalRead += step
+
+                    var i = 0
+                    val searchLimit = filled - 16
+                    while (i <= searchLimit) {
+                        if (window[i] == 0x1F.toByte() &&
+                            window[i + 1] == 0x43.toByte() &&
+                            window[i + 2] == 0xB6.toByte() &&
+                            window[i + 3] == 0x75.toByte()
+                        ) {
+                            val szPair = readEbmlSizeFromArray(window, i + 4, filled)
+                            if (szPair != null && szPair.first >= 0L) {
+                                val afterHdr = i + 4 + szPair.second
+                                if (afterHdr < filled) {
+                                    val nextByte = window[afterHdr].toInt() and 0xFF
+                                    if (nextByte == 0xE7 || nextByte == 0xA7 || nextByte == 0xAB || nextByte == 0xA3 || nextByte == 0xA0) {
+                                        val exactRelOffset = windowStartOffset + i.toLong()
+                                        val tailBuf = ByteArrayOutputStream((filled - i) + (len - consumed))
+                                        tailBuf.write(window, i, filled - i)
+                                        if (consumed < len) {
+                                            tailBuf.write(src, off + consumed, len - consumed)
+                                        }
+                                        return Pair(exactRelOffset, tailBuf.toByteArray())
+                                    }
+                                }
+                            }
+                        }
+                        i++
+                    }
+
+                    if (filled >= window.size) {
+                        val keep = 16
+                        val drop = filled - keep
+                        System.arraycopy(window, drop, window, 0, keep)
+                        windowStartOffset += drop.toLong()
+                        filled = keep
+                    }
+                }
+                return null
             }
-            val safeEnd = if (requestedEndInclusive in requestedStartOffset until safeTotal) {
+
+            if (initialPeek.isNotEmpty()) {
+                val found = appendToWindow(initialPeek, 0, initialPeek.size)
+                if (found != null) return Triple(found.first, found.second, ByteArray(0))
+            }
+
+            val chunk = ByteArray(16384)
+            while (totalRead < scanLimit.toLong()) {
+                val toRead = min(chunk.size.toLong(), scanLimit.toLong() - totalRead).toInt()
+                val n = upstream.read(chunk, 0, toRead)
+                if (n <= 0) break
+                val found = appendToWindow(chunk, 0, n)
+                if (found != null) return Triple(found.first, found.second, ByteArray(0))
+            }
+            return Triple(-1L, null, savedForRawFallback.toByteArray())
+        }
+
+        /**
+         * Streams Matroska Clusters while preserving the EXACT original file byte offset and byte length of
+         * every single Cluster (using EBML `Void` padding when the 128 kbps AAC Cluster is smaller than the
+         * original 5.1 AC3/EAC3/DTS/TrueHD Cluster). Any post-Cluster EOF elements (`Cues`, `Tags`, `Chapters`)
+         * are passed through verbatim so `Content-Length` matches to the exact byte.
+         */
+        private fun streamByteExactClustersLoop(
+            reader: EbmlRecordingReader,
+            out: OutputStream,
+            ctx: ByteExactMkvContext,
+            transcoder: ChromecastAudioTranscoder?,
+            initialClusterSize: Long?,
+            initialClusterSizeRaw: ByteArray?,
+            startClusterFileOffset: Long,
+            initialRemainingToSend: Long
+        ) {
+            var remainingToSend = initialRemainingToSend
+            if (remainingToSend <= 0L) return
+
+            val videoTrackNumbers = ctx.videoTracks.map { it.trackNumber }.toHashSet()
+            val audioTrackNumber = ctx.chosenAudio.trackNumber
+
+            fun writeLimited(data: ByteArray, offset: Int = 0, len: Int = data.size): Boolean {
+                if (remainingToSend <= 0L || len <= 0) return remainingToSend > 0L
+                val toWrite = min(len.toLong(), remainingToSend).toInt()
+                out.write(data, offset, toWrite)
+                remainingToSend -= toWrite.toLong()
+                return remainingToSend > 0L
+            }
+
+            fun processSingleByteExactCluster(clusterFileOffset: Long, origSizeVintLen: Int, origBodySize: Long): Boolean {
+                if (origBodySize < 0L || origBodySize > 67_108_864L) return false
+                val origBodyInt = origBodySize.toInt()
+                val origTotalBytes = 4 + origSizeVintLen + origBodyInt
+
+                val clusterElements = ArrayList<Pair<Boolean, ByteArray>>(256)
+                var totalBodySize = 0
+                var bytesReadInCluster = 0L
+                var sourceClusterTc = 0L
+
+                while (bytesReadInCluster < origBodySize) {
+                    val cId = reader.readElementIdWithRaw() ?: return false
+                    val cSz = reader.readElementSizeWithRaw() ?: return false
+                    bytesReadInCluster += cId.second.size + cSz.second.size
+
+                    val payloadLen = cSz.first
+                    if (payloadLen < 0L || bytesReadInCluster + payloadLen > origBodySize) return false
+                    bytesReadInCluster += payloadLen
+
+                    when (cId.first) {
+                        0xE7L -> {
+                            // Cluster Timecode
+                            val tcBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                            sourceClusterTc = readEbmlUint(tcBytes, 0, tcBytes.size)
+                            val elem = ByteArray(cId.second.size + cSz.second.size + tcBytes.size)
+                            System.arraycopy(cId.second, 0, elem, 0, cId.second.size)
+                            System.arraycopy(cSz.second, 0, elem, cId.second.size, cSz.second.size)
+                            System.arraycopy(tcBytes, 0, elem, cId.second.size + cSz.second.size, tcBytes.size)
+                            clusterElements.add(Pair(false, elem))
+                            totalBodySize += elem.size
+                        }
+                        0xA3L -> {
+                            // SimpleBlock
+                            val blockBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                            val hdr = parseMatroskaBlockHeader(blockBytes)
+                            if (hdr != null) {
+                                if (videoTrackNumbers.contains(hdr.trackNumber)) {
+                                    // Preserve original Video SimpleBlock 100% verbatim!
+                                    val elem = ByteArray(cId.second.size + cSz.second.size + blockBytes.size)
+                                    System.arraycopy(cId.second, 0, elem, 0, cId.second.size)
+                                    System.arraycopy(cSz.second, 0, elem, cId.second.size, cSz.second.size)
+                                    System.arraycopy(blockBytes, 0, elem, cId.second.size + cSz.second.size, blockBytes.size)
+                                    clusterElements.add(Pair(false, elem))
+                                    totalBodySize += elem.size
+                                } else if (hdr.trackNumber == audioTrackNumber) {
+                                    if (transcoder == null) {
+                                        val elem = ByteArray(cId.second.size + cSz.second.size + blockBytes.size)
+                                        System.arraycopy(cId.second, 0, elem, 0, cId.second.size)
+                                        System.arraycopy(cSz.second, 0, elem, cId.second.size, cSz.second.size)
+                                        System.arraycopy(blockBytes, 0, elem, cId.second.size + cSz.second.size, blockBytes.size)
+                                        clusterElements.add(Pair(true, elem))
+                                        totalBodySize += elem.size
+                                    } else {
+                                        val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
+                                        val frames = unlaceMatroskaBlockFrames(blockBytes, hdr, ctx.chosenAudio.sampleStrippedBytes)
+                                        val basePtsUs = (blockTimecode * ctx.timecodeScaleNs) / 1000L
+                                        for ((fIdx, f) in frames.withIndex()) {
+                                            val framePtsUs = basePtsUs + (fIdx * 21_333L)
+                                            transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
+                                                val outBlockTc = (outPtsUs * 1000L) / ctx.timecodeScaleNs
+                                                val rel = (outBlockTc - sourceClusterTc).coerceIn(0L, 32767L).toShort()
+                                                val sbBuf = ByteArrayOutputStream(encodedAudio.size + 16)
+                                                writeSimpleBlock(sbBuf, audioTrackNumber, rel, encodedAudio)
+                                                val sbBytes = sbBuf.toByteArray()
+                                                clusterElements.add(Pair(true, sbBytes))
+                                                totalBodySize += sbBytes.size
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        0xA0L -> {
+                            // BlockGroup
+                            val groupBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                            var gp = 0
+                            var innerBlock: ByteArray? = null
+                            while (gp < groupBytes.size) {
+                                val gId = readEbmlIdFromArray(groupBytes, gp, groupBytes.size) ?: break
+                                gp += gId.second
+                                val gSz = readEbmlSizeFromArray(groupBytes, gp, groupBytes.size) ?: break
+                                gp += gSz.second
+                                val gLen = gSz.first.toInt()
+                                if (gLen < 0 || gp + gLen > groupBytes.size) break
+                                if (gId.first == 0xA1L) {
+                                    innerBlock = groupBytes.copyOfRange(gp, gp + gLen)
+                                    break
+                                }
+                                gp += gLen
+                            }
+                            val hdr = innerBlock?.let { parseMatroskaBlockHeader(it) }
+                            if (hdr != null && innerBlock != null) {
+                                if (videoTrackNumbers.contains(hdr.trackNumber)) {
+                                    val elem = ByteArray(cId.second.size + cSz.second.size + groupBytes.size)
+                                    System.arraycopy(cId.second, 0, elem, 0, cId.second.size)
+                                    System.arraycopy(cSz.second, 0, elem, cId.second.size, cSz.second.size)
+                                    System.arraycopy(groupBytes, 0, elem, cId.second.size + cSz.second.size, groupBytes.size)
+                                    clusterElements.add(Pair(false, elem))
+                                    totalBodySize += elem.size
+                                } else if (hdr.trackNumber == audioTrackNumber) {
+                                    if (transcoder == null) {
+                                        val elem = ByteArray(cId.second.size + cSz.second.size + groupBytes.size)
+                                        System.arraycopy(cId.second, 0, elem, 0, cId.second.size)
+                                        System.arraycopy(cSz.second, 0, elem, cId.second.size, cSz.second.size)
+                                        System.arraycopy(groupBytes, 0, elem, cId.second.size + cSz.second.size, groupBytes.size)
+                                        clusterElements.add(Pair(true, elem))
+                                        totalBodySize += elem.size
+                                    } else {
+                                        val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
+                                        val frames = unlaceMatroskaBlockFrames(innerBlock, hdr, ctx.chosenAudio.sampleStrippedBytes)
+                                        val basePtsUs = (blockTimecode * ctx.timecodeScaleNs) / 1000L
+                                        for ((fIdx, f) in frames.withIndex()) {
+                                            val framePtsUs = basePtsUs + (fIdx * 21_333L)
+                                            transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
+                                                val outBlockTc = (outPtsUs * 1000L) / ctx.timecodeScaleNs
+                                                val rel = (outBlockTc - sourceClusterTc).coerceIn(0L, 32767L).toShort()
+                                                val sbBuf = ByteArrayOutputStream(encodedAudio.size + 16)
+                                                writeSimpleBlock(sbBuf, audioTrackNumber, rel, encodedAudio)
+                                                val sbBytes = sbBuf.toByteArray()
+                                                clusterElements.add(Pair(true, sbBytes))
+                                                totalBodySize += sbBytes.size
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else -> {
+                            if (!reader.skipExact(payloadLen)) return false
+                        }
+                    }
+                }
+
+                // Size invariant safety guard: guarantee `totalBodySize <= origBodyInt` so the emitted Cluster
+                // plus optional Void padding ALWAYS equals `origTotalBytes` to the exact byte!
+                while (totalBodySize > origBodyInt) {
+                    val lastAudioIdx = clusterElements.indexOfLast { it.first }
+                    if (lastAudioIdx < 0) break
+                    totalBodySize -= clusterElements.removeAt(lastAudioIdx).second.size
+                }
+
+                val minVintLen = minEbmlSizeVintLen(totalBodySize.toLong())
+                val gap = origTotalBytes - (4 + minVintLen + totalBodySize)
+                val finalBuf = ByteArrayOutputStream(origTotalBytes)
+                writeEbmlId(finalBuf, 0x1F43B675L)
+                if (gap == 1 && minVintLen < 8) {
+                    writeEbmlSizeWithLength(finalBuf, totalBodySize.toLong(), minVintLen + 1)
+                    for (entry in clusterElements) {
+                        finalBuf.write(entry.second)
+                    }
+                } else {
+                    writeEbmlSizeWithLength(finalBuf, totalBodySize.toLong(), minVintLen)
+                    for (entry in clusterElements) {
+                        finalBuf.write(entry.second)
+                    }
+                    if (gap >= 2) {
+                        writeEbmlVoidElement(finalBuf, gap)
+                    }
+                }
+
+                val finalClusterBytes = finalBuf.toByteArray()
+                ctx.putCluster(clusterFileOffset, finalClusterBytes)
+                val keepGoing = writeLimited(finalClusterBytes)
+                out.flush()
+                return keepGoing
+            }
+
+            var currentOffset = startClusterFileOffset
+            if (initialClusterSize != null && initialClusterSizeRaw != null) {
+                if (!processSingleByteExactCluster(currentOffset, initialClusterSizeRaw.size, initialClusterSize)) {
+                    return
+                }
+                currentOffset += 4L + initialClusterSizeRaw.size.toLong() + initialClusterSize
+            }
+
+            val passBuf = ByteArray(16384)
+            while (remainingToSend > 0L) {
+                val nextId = reader.readElementIdWithRaw() ?: break
+                val nextSz = reader.readElementSizeWithRaw() ?: break
+                if (nextId.first == 0x1F43B675L && nextSz.first >= 0L) {
+                    if (!processSingleByteExactCluster(currentOffset, nextSz.second.size, nextSz.first)) {
+                        break
+                    }
+                    currentOffset += 4L + nextSz.second.size.toLong() + nextSz.first
+                } else {
+                    // Non-Cluster Segment element (e.g. EOF Cues, Tags, Chapters, SeekHead, Void):
+                    // pass through 100% verbatim so exact file layout and Content-Length are preserved!
+                    if (!writeLimited(nextId.second)) break
+                    if (!writeLimited(nextSz.second)) break
+                    currentOffset += nextId.second.size.toLong() + nextSz.second.size.toLong()
+                    var remPayload = nextSz.first
+                    if (remPayload < 0L) {
+                        while (remainingToSend > 0L) {
+                            val step = min(passBuf.size.toLong(), remainingToSend).toInt()
+                            val n = reader.readChunk(passBuf, step)
+                            if (n <= 0) break
+                            if (!writeLimited(passBuf, 0, n)) break
+                            out.flush()
+                        }
+                        break
+                    } else {
+                        while (remPayload > 0L && remainingToSend > 0L) {
+                            val step = min(min(remPayload, passBuf.size.toLong()), remainingToSend).toInt()
+                            val n = reader.readChunk(passBuf, step)
+                            if (n <= 0) break
+                            remPayload -= n.toLong()
+                            currentOffset += n.toLong()
+                            if (!writeLimited(passBuf, 0, n)) break
+                        }
+                        out.flush()
+                    }
+                }
+            }
+        }
+
+        /**
+         * Handles ANY follow-up or ranged HTTP request on a Byte-Exact Matroska stream:
+         * 1. Header slice (`start < firstClusterOffset`): served straight from `ctx.patchedHeaderBytes` in RAM!
+         * 2. Mid-Cluster pause/resume (`ctx.findClusterContaining(start)`): served from the 4 MB recent-Cluster
+         *    ring cache, then seamlessly resumes transcoding at the next exact Cluster boundary!
+         * 3. Exact `Cues` timeline seek (`0x1F43B675` Cluster at `start`): transcodes byte-exact Clusters from `start`!
+         * 4. EOF `Cues`/`Tags`/`SeekHead`/`Chapters`/`Void` fetch: passes raw TorrServer bytes straight through!
+         * 5. Unaligned mid-Cluster binary-search seek (MKVs without `Cues`): scans to next Cluster, emits exact
+         *    EBML `Void` alignment padding, and transcodes byte-exact Clusters from there!
+         */
+        private fun serveByteExactMatroskaFromContext(
+            ctx: ByteExactMkvContext,
+            out: OutputStream,
+            streamTitle: String,
+            clientHasRange: Boolean,
+            requestedStartOffset: Long,
+            requestedEndInclusive: Long,
+            openUpstreamAtOffset: (Long) -> BufferedInputStream?
+        ) {
+            val safeTotal = ctx.totalFileBytes
+            val safeStart = requestedStartOffset.coerceAtLeast(0L)
+            if (safeStart >= safeTotal) {
+                val r416 = buildString {
+                    append("HTTP/1.1 416 Requested Range Not Satisfiable\r\n")
+                    append("Content-Range: bytes */$safeTotal\r\n")
+                    append("Content-Length: 0\r\n")
+                    append("Access-Control-Allow-Origin: *\r\n")
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(r416.toByteArray(Charsets.US_ASCII))
+                out.flush()
+                return
+            }
+            val safeEnd = if (requestedEndInclusive in safeStart until safeTotal) {
                 requestedEndInclusive
             } else {
                 safeTotal - 1L
             }
-            val rangeLen = (safeEnd - requestedStartOffset + 1L).coerceAtLeast(1L)
+            var remainingToSend = safeEnd - safeStart + 1L
 
-            // Fast-path for Chromium's small end-of-file probe (e.g. last 64 KB) when opening a stream
-            if (safeTotal - requestedStartOffset <= 262_144L || rangeLen <= 65_536L) {
-                val probeHeaders = buildString {
-                    append("HTTP/1.1 206 Partial Content\r\n")
-                    append("Content-Type: video/mp4\r\n")
-                    append("icy-name: $streamTitle\r\n")
-                    append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotal\r\n")
-                    append("Content-Length: $rangeLen\r\n")
-                    append("Access-Control-Allow-Origin: *\r\n")
-                    append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
-                    append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
-                    append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
-                    append("Connection: close\r\n\r\n")
+            // Case 1: Starts inside the patched EBML/Segment/SeekHead/Info/Tracks header
+            if (safeStart < ctx.firstClusterOffset) {
+                writeCastHttpResponseHeaders(out, streamTitle, clientHasRange, safeStart, safeEnd, safeTotal)
+                val headerSliceLen = min(ctx.firstClusterOffset - safeStart, remainingToSend).toInt()
+                if (headerSliceLen > 0) {
+                    out.write(ctx.patchedHeaderBytes, safeStart.toInt(), headerSliceLen)
+                    out.flush()
+                    remainingToSend -= headerSliceLen.toLong()
                 }
-                out.write(probeHeaders.toByteArray(Charsets.US_ASCII))
+                if (remainingToSend <= 0L) return
+
+                val upstream = openUpstreamAtOffset(ctx.firstClusterOffset) ?: return
+                val reader = EbmlRecordingReader(ByteArray(0), upstream).apply { recordPassthrough = false }
+                val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
+                val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
+                try {
+                    streamByteExactClustersLoop(
+                        reader = reader,
+                        out = out,
+                        ctx = ctx,
+                        transcoder = transcoder,
+                        initialClusterSize = null,
+                        initialClusterSizeRaw = null,
+                        startClusterFileOffset = ctx.firstClusterOffset,
+                        initialRemainingToSend = remainingToSend
+                    )
+                } catch (_: Throwable) {
+                } finally {
+                    transcoder?.release()
+                }
+                return
+            }
+
+            // Case 2: Cache hit inside a recently emitted Cluster (e.g. Chromium pause/resume or buffer refill)
+            val cachedCluster = ctx.findClusterContaining(safeStart)
+            if (cachedCluster != null) {
+                writeCastHttpResponseHeaders(out, streamTitle, clientHasRange, safeStart, safeEnd, safeTotal)
+                val (clusterStartOff, clusterBytes) = cachedCluster
+                val relOff = (safeStart - clusterStartOff).toInt()
+                val fromCache = min((clusterBytes.size - relOff).toLong(), remainingToSend).toInt()
+                if (fromCache > 0) {
+                    out.write(clusterBytes, relOff, fromCache)
+                    out.flush()
+                    remainingToSend -= fromCache.toLong()
+                }
+                if (remainingToSend <= 0L) return
+
+                val nextClusterOffset = clusterStartOff + clusterBytes.size.toLong()
+                val upstream = openUpstreamAtOffset(nextClusterOffset) ?: return
+                val reader = EbmlRecordingReader(ByteArray(0), upstream).apply { recordPassthrough = false }
+                val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
+                val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
+                try {
+                    streamByteExactClustersLoop(
+                        reader = reader,
+                        out = out,
+                        ctx = ctx,
+                        transcoder = transcoder,
+                        initialClusterSize = null,
+                        initialClusterSizeRaw = null,
+                        startClusterFileOffset = nextClusterOffset,
+                        initialRemainingToSend = remainingToSend
+                    )
+                } catch (_: Throwable) {
+                } finally {
+                    transcoder?.release()
+                }
+                return
+            }
+
+            // Case 3: Cache miss at `safeStart >= firstClusterOffset` (Cues seek, EOF Cues read, or binary-search seek)
+            val upstream = openUpstreamAtOffset(safeStart) ?: return
+            val peekLen = min(4L, remainingToSend).toInt()
+            val peek = ByteArray(peekLen)
+            var peekRead = 0
+            while (peekRead < peekLen) {
+                val r = upstream.read(peek, peekRead, peekLen - peekRead)
+                if (r <= 0) break
+                peekRead += r
+            }
+            val initialPeek = if (peekRead == peekLen) peek else peek.copyOf(peekRead)
+
+            val isClusterStart = initialPeek.size == 4 &&
+                initialPeek[0] == 0x1F.toByte() &&
+                initialPeek[1] == 0x43.toByte() &&
+                initialPeek[2] == 0xB6.toByte() &&
+                initialPeek[3] == 0x75.toByte()
+
+            val isKnownNonClusterElement = initialPeek.size == 4 && (
+                (initialPeek[0] == 0x1C.toByte() && initialPeek[1] == 0x53.toByte() && initialPeek[2] == 0xBB.toByte() && initialPeek[3] == 0x6B.toByte()) || // Cues
+                    (initialPeek[0] == 0x12.toByte() && initialPeek[1] == 0x54.toByte() && initialPeek[2] == 0xC3.toByte() && initialPeek[3] == 0x67.toByte()) || // Tags
+                    (initialPeek[0] == 0x11.toByte() && initialPeek[1] == 0x4D.toByte() && initialPeek[2] == 0x9B.toByte() && initialPeek[3] == 0x74.toByte()) || // SeekHead
+                    (initialPeek[0] == 0x10.toByte() && initialPeek[1] == 0x43.toByte() && initialPeek[2] == 0xA7.toByte() && initialPeek[3] == 0x70.toByte()) || // Chapters
+                    (initialPeek[0] == 0x19.toByte() && initialPeek[1] == 0x41.toByte() && initialPeek[2] == 0xA4.toByte() && initialPeek[3] == 0x69.toByte()) || // Attachments
+                    (initialPeek[0] == 0xEC.toByte()) // Void
+                )
+
+            // Subcase 3a: Exact Cluster alignment (e.g. Cues timeline seek!)
+            if (isClusterStart) {
+                writeCastHttpResponseHeaders(out, streamTitle, clientHasRange, safeStart, safeEnd, safeTotal)
+                val reader = EbmlRecordingReader(initialPeek, upstream).apply { recordPassthrough = false }
+                val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
+                val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
+                try {
+                    streamByteExactClustersLoop(
+                        reader = reader,
+                        out = out,
+                        ctx = ctx,
+                        transcoder = transcoder,
+                        initialClusterSize = null,
+                        initialClusterSizeRaw = null,
+                        startClusterFileOffset = safeStart,
+                        initialRemainingToSend = remainingToSend
+                    )
+                } catch (_: Throwable) {
+                } finally {
+                    transcoder?.release()
+                }
+                return
+            }
+
+            // Subcase 3b: Raw non-Cluster element (Cues, Tags, SeekHead, Chapters, Void) or small EOF tail probe
+            if (isKnownNonClusterElement || (safeTotal - safeStart) <= 262_144L || remainingToSend <= 65_536L) {
+                writeCastHttpResponseHeaders(out, streamTitle, clientHasRange, safeStart, safeEnd, safeTotal)
+                if (initialPeek.isNotEmpty()) {
+                    val toWrite = min(initialPeek.size.toLong(), remainingToSend).toInt()
+                    out.write(initialPeek, 0, toWrite)
+                    remainingToSend -= toWrite.toLong()
+                }
                 val buf = ByteArray(16384)
-                var remaining = rangeLen
-                while (remaining > 0L) {
-                    val toRead = min(remaining, buf.size.toLong()).toInt()
-                    val n = upstream.read(buf, 0, toRead)
+                while (remainingToSend > 0L) {
+                    val n = upstream.read(buf, 0, min(buf.size.toLong(), remainingToSend).toInt())
                     if (n <= 0) break
                     out.write(buf, 0, n)
-                    remaining -= n
+                    remainingToSend -= n.toLong()
                 }
                 out.flush()
-                return true
+                return
             }
 
-            val syncedPrefix = syncToNextMatroskaCluster(upstream) ?: return false
-            val reader = EbmlRecordingReader(syncedPrefix, upstream).apply {
-                recordPassthrough = false
-            }
-
-            // Read the first synced Cluster ID + Size
-            val firstId = reader.readElementId() ?: return false
-            if (firstId.first != 0x1F43B675L) return false
-            val firstSz = reader.readElementSize() ?: return false
-
-            val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
-            val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
-
-            try {
-                val httpHeaders = buildString {
-                    append("HTTP/1.1 206 Partial Content\r\n")
-                    append("Content-Type: video/mp4\r\n")
-                    append("icy-name: $streamTitle\r\n")
-                    append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotal\r\n")
-                    append("Access-Control-Allow-Origin: *\r\n")
-                    append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
-                    append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
-                    append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
-                    append("Connection: close\r\n\r\n")
+            // Subcase 3c: Unaligned mid-Cluster seek (MKV without Cues or cache-evicted mid-Cluster resume)
+            val (relClusterOffset, clusterPrefix, rawFallback) = scanForNextMatroskaClusterWithOffset(
+                initialPeek = initialPeek,
+                upstream = upstream,
+                maxScanBytes = remainingToSend
+            )
+            writeCastHttpResponseHeaders(out, streamTitle, clientHasRange, safeStart, safeEnd, safeTotal)
+            if (relClusterOffset >= 0L && clusterPrefix != null) {
+                val padLen = min(relClusterOffset, remainingToSend).toInt()
+                if (padLen == 1) {
+                    out.write(0x00)
+                    remainingToSend -= 1L
+                } else if (padLen >= 2) {
+                    writeEbmlVoidElement(out, padLen)
+                    remainingToSend -= padLen.toLong()
                 }
-                out.write(httpHeaders.toByteArray(Charsets.US_ASCII))
                 out.flush()
+                if (remainingToSend <= 0L) return
 
-                streamTranscodedClustersLoop(
-                    reader = reader,
-                    out = out,
-                    videoTracks = ctx.videoTracks,
-                    chosenAudio = ctx.chosenAudio,
-                    timecodeScaleNs = ctx.timecodeScaleNs,
-                    transcoder = transcoder,
-                    firstClusterSize = firstSz.first
-                )
-            } catch (_: Throwable) {
-            } finally {
-                transcoder?.release()
+                val reader = EbmlRecordingReader(clusterPrefix, upstream).apply { recordPassthrough = false }
+                val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
+                val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
+                try {
+                    streamByteExactClustersLoop(
+                        reader = reader,
+                        out = out,
+                        ctx = ctx,
+                        transcoder = transcoder,
+                        initialClusterSize = null,
+                        initialClusterSizeRaw = null,
+                        startClusterFileOffset = safeStart + relClusterOffset,
+                        initialRemainingToSend = remainingToSend
+                    )
+                } catch (_: Throwable) {
+                } finally {
+                    transcoder?.release()
+                }
+            } else {
+                // No Cluster found (EOF metadata region): pass raw bytes straight through
+                if (rawFallback.isNotEmpty()) {
+                    val toWrite = min(rawFallback.size.toLong(), remainingToSend).toInt()
+                    out.write(rawFallback, 0, toWrite)
+                    remainingToSend -= toWrite.toLong()
+                }
+                val buf = ByteArray(16384)
+                while (remainingToSend > 0L) {
+                    val n = upstream.read(buf, 0, min(buf.size.toLong(), remainingToSend).toInt())
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    remainingToSend -= n.toLong()
+                }
+                out.flush()
             }
-            return true
         }
 
         /**
-         * Inspects a Matroska stream for Chromecast and, if its audio track uses `A_EAC3`, `A_AC3`,
-         * `A_DTS`, `A_TRUEHD`, or `>2` channels, remuxes and transcodes the audio on-the-fly to
-         * 2.0 Stereo `A_AAC` (or `A_PCM/INT/LIT`).
-         *
-         * Returns `Pair(true, null)` if it handled and streamed the transcoded response, or
-         * `Pair(false, passthroughPrefixBytes)` if the file already has 2.0 stereo Chromecast-native audio.
+         * Inspects a Matroska stream at byte 0 for Chromecast:
+         * - If all enabled audio tracks use Chromecast-native codecs (`A_AAC*`, `A_OPUS`, `A_VORBIS`, `A_FLAC`,
+         *   `A_MPEG/L3`, `A_MPEG/L2`, `A_PCM/INT/LIT` — 2.0 OR 5.1!), returns `Pair(false, passthroughBytes)` for
+         *   100% raw passthrough with native seeking.
+         * - Otherwise (AC3, EAC3, DTS, TrueHD, MLP), prefers **Byte-Exact EBML `Void`-Padded Matroska Transcoding**:
+         *   keeps the original finite `Segment` size, `SeekHead`, `Info`, and EOF `Cues` at their exact original file
+         *   offsets, patches ONLY `Tracks` in-place (+ `Void` padding), and transcodes every Cluster's audio to
+         *   128 kbps 2.0 Stereo AAC-LC padded with `Void` to the exact original Cluster byte length!
+         * - Automatically falls back to v34's proven `200 OK` + `Accept-Ranges: none` streaming mode ONLY for rare
+         *   edge-case MKVs with unknown Segment/Cluster sizes, unknown file size, or no AAC encoder.
          */
         private fun streamMatroskaWithChromecastAudio(
             initialPrefix: ByteArray,
@@ -4806,35 +5630,51 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             streamKey: String,
             streamTitle: String = "North Stream",
             totalFileBytes: Long = -1L,
-            requestedStartOffset: Long = 0L,
+            clientHasRange: Boolean = false,
             requestedEndInclusive: Long = -1L
         ): Pair<Boolean, ByteArray?> {
             val reader = EbmlRecordingReader(initialPrefix, upstream)
+            val patchedHeaderBuf = ByteArrayOutputStream(65536)
 
             // 1. Read EBML Header (0x1A45DFA3)
-            val ebmlId = reader.readElementId() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+            val ebmlId = reader.readElementIdWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
             if (ebmlId.first != 0x1A45DFA3L) return Pair(false, reader.drainRemainingPrefixToPassthrough())
-            val ebmlSize = reader.readElementSize() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+            val ebmlSize = reader.readElementSizeWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
             if (ebmlSize.first <= 0L || ebmlSize.first > 65536L) return Pair(false, reader.drainRemainingPrefixToPassthrough())
             val ebmlBody = reader.readExact(ebmlSize.first.toInt()) ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
 
+            patchedHeaderBuf.write(ebmlId.second)
+            patchedHeaderBuf.write(ebmlSize.second)
+            patchedHeaderBuf.write(ebmlBody)
+
             // 2. Read Segment Header (0x18538067)
-            val segId = reader.readElementId() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+            val segId = reader.readElementIdWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
             if (segId.first != 0x18538067L) return Pair(false, reader.drainRemainingPrefixToPassthrough())
-            reader.readElementSize() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+            val segSize = reader.readElementSizeWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+
+            patchedHeaderBuf.write(segId.second)
+            patchedHeaderBuf.write(segSize.second)
 
             var infoBody: ByteArray? = null
             var timecodeScaleNs = 1_000_000L
             var tracksList: List<MkvTrackInfo> = emptyList()
+            var tracksHeaderInsertPos = -1
+            var origTracksTotalBytes = -1
+            var firstClusterOffset = -1L
             var firstClusterSize: Long? = null
+            var firstClusterSizeRaw: ByteArray? = null
+            var headerTooLargeForByteExact = false
 
-            // 3. Scan top-level Segment elements until we reach the first Cluster (0x1F43B675)
+            // 3. Scan top-level Segment elements until the first Cluster (0x1F43B675)
             while (true) {
-                val elId = reader.readElementId() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
-                val elSize = reader.readElementSize() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+                val elemStartOffset = reader.totalBytesRead
+                val elId = reader.readElementIdWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+                val elSize = reader.readElementSizeWithRaw() ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
 
                 if (elId.first == 0x1F43B675L) {
+                    firstClusterOffset = elemStartOffset
                     firstClusterSize = elSize.first
+                    firstClusterSizeRaw = elSize.second
                     break
                 }
 
@@ -4848,6 +5688,13 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         val body = reader.readExact(sz.toInt()) ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
                         infoBody = body
                         timecodeScaleNs = parseTimecodeScaleFromInfo(body)
+                        if (!headerTooLargeForByteExact && patchedHeaderBuf.size() + elId.second.size + elSize.second.size + body.size <= 4_194_304) {
+                            patchedHeaderBuf.write(elId.second)
+                            patchedHeaderBuf.write(elSize.second)
+                            patchedHeaderBuf.write(body)
+                        } else {
+                            headerTooLargeForByteExact = true
+                        }
                     }
                     0x1654AE6BL -> {
                         // Tracks
@@ -4855,20 +5702,39 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         val body = reader.readExact(sz.toInt()) ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
                         tracksList = parseMkvTracks(body)
 
-                        // Check immediately if the file is already 100% Chromecast-safe 2.0 stereo!
+                        // Check immediately if the file is already 100% Chromecast-native audio!
                         val enabledAudio = tracksList.filter { it.trackType == 2 && it.flagEnabled != 0 }
                         if (enabledAudio.isEmpty() ||
                             (enabledAudio.all { isChromecastSafeDirectAudio(it) } && isChromecastSafeDirectAudio(enabledAudio.first()))
                         ) {
                             return Pair(false, reader.drainRemainingPrefixToPassthrough())
                         }
-                        // We ARE going to transcode/remux for Chromecast/VLC: mark streamKey immediately and stop passthrough buffer!
-                        transcodedStreamUrls[streamKey] = true
+
+                        // Stop passthrough recording — we will transcode/remux this MKV!
                         reader.recordPassthrough = false
                         reader.passthroughBuffer.reset()
+
+                        tracksHeaderInsertPos = patchedHeaderBuf.size()
+                        origTracksTotalBytes = elId.second.size + elSize.second.size + body.size
+                        if (!headerTooLargeForByteExact && patchedHeaderBuf.size() + origTracksTotalBytes <= 4_194_304) {
+                            patchedHeaderBuf.write(elId.second)
+                            patchedHeaderBuf.write(elSize.second)
+                            patchedHeaderBuf.write(body)
+                        } else {
+                            headerTooLargeForByteExact = true
+                        }
                     }
                     else -> {
-                        if (!reader.skipExact(sz)) return Pair(false, reader.drainRemainingPrefixToPassthrough())
+                        // Preserve SeekHead, Void, Chapters, Tags, Attachments verbatim in `patchedHeaderBuf`
+                        if (!headerTooLargeForByteExact && patchedHeaderBuf.size().toLong() + elId.second.size + elSize.second.size + sz <= 4_194_304L) {
+                            val body = reader.readExact(sz.toInt()) ?: return Pair(false, reader.drainRemainingPrefixToPassthrough())
+                            patchedHeaderBuf.write(elId.second)
+                            patchedHeaderBuf.write(elSize.second)
+                            patchedHeaderBuf.write(body)
+                        } else {
+                            headerTooLargeForByteExact = true
+                            if (!reader.skipExact(sz)) return Pair(false, reader.drainRemainingPrefixToPassthrough())
+                        }
                     }
                 }
             }
@@ -4881,44 +5747,97 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val nonCommentary = audioTracks.filter { !it.name.contains("commentary", ignoreCase = true) }.ifEmpty { audioTracks }
             val primaryAudio = nonCommentary.firstOrNull { it.flagDefault != 0 } ?: nonCommentary.first()
-            // If there is an already-compatible 2.0 stereo track in the same language as primaryAudio, use it; otherwise transcode primaryAudio
             val chosenAudio = nonCommentary.firstOrNull {
                 isChromecastSafeDirectAudio(it) && (it.language.equals(primaryAudio.language, ignoreCase = true) || primaryAudio.language == "und")
             } ?: primaryAudio
 
             val needsAudioDecode = !isChromecastSafeDirectAudio(chosenAudio)
             val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(chosenAudio) else null
-
             val parsedDurationMs = parseDurationMsFromInfo(infoBody, timecodeScaleNs)
-            val safeTotalBytes = if (totalFileBytes > 0L) totalFileBytes else 1_610_612_736L
 
-            transcodedStreamUrls[streamKey] = true
-            transcodedStreamContextMap[streamKey] = TranscodedCastStreamContext(
-                ebmlHeaderBody = ebmlBody,
-                infoBody = infoBody,
-                timecodeScaleNs = timecodeScaleNs,
-                videoTracks = videoTracks,
-                chosenAudio = chosenAudio,
-                durationMs = parsedDurationMs,
-                totalFileBytes = safeTotalBytes,
-                firstClusterOffset = 65536L
-            )
+            // Attempt Byte-Exact Void-Padded Matroska Mode (full native Cues seeking + strict RFC 7233 headers!)
+            val rawHeaderBytes = if (!headerTooLargeForByteExact) patchedHeaderBuf.toByteArray() else null
+            val replacementTracks = if (rawHeaderBytes != null &&
+                origTracksTotalBytes > 0 &&
+                tracksHeaderInsertPos >= 0 &&
+                tracksHeaderInsertPos + origTracksTotalBytes <= rawHeaderBytes.size &&
+                segSize.first >= 0L &&
+                firstClusterOffset == rawHeaderBytes.size.toLong() &&
+                firstClusterSize != null && firstClusterSize >= 0L && firstClusterSizeRaw != null &&
+                totalFileBytes > firstClusterOffset &&
+                (transcoder == null || transcoder.useAacOutput)
+            ) {
+                buildByteExactPatchedTracksReplacement(origTracksTotalBytes, videoTracks, chosenAudio, transcoder)
+            } else {
+                null
+            }
 
-            try {
-                val safeEnd = if (requestedEndInclusive in requestedStartOffset until safeTotalBytes) {
-                    requestedEndInclusive
-                } else {
-                    safeTotalBytes - 1L
+            if (rawHeaderBytes != null && replacementTracks != null && firstClusterSize != null && firstClusterSizeRaw != null) {
+                System.arraycopy(replacementTracks, 0, rawHeaderBytes, tracksHeaderInsertPos, origTracksTotalBytes)
+                val ctx = ByteExactMkvContext(
+                    patchedHeaderBytes = rawHeaderBytes,
+                    firstClusterOffset = firstClusterOffset,
+                    totalFileBytes = totalFileBytes,
+                    timecodeScaleNs = timecodeScaleNs,
+                    videoTracks = videoTracks,
+                    chosenAudio = chosenAudio,
+                    durationMs = parsedDurationMs
+                )
+                transcodedStreamContextMap[streamKey] = ctx
+                transcodedStreamUrls.remove(streamKey)
+
+                try {
+                    val safeEnd = if (requestedEndInclusive in 0L until totalFileBytes) {
+                        requestedEndInclusive
+                    } else {
+                        totalFileBytes - 1L
+                    }
+                    var remainingToSend = safeEnd + 1L
+                    writeCastHttpResponseHeaders(
+                        out = out,
+                        streamTitle = streamTitle,
+                        clientHasRange = clientHasRange,
+                        startOffset = 0L,
+                        endInclusive = safeEnd,
+                        totalFileBytes = totalFileBytes
+                    )
+
+                    val headerWriteLen = min(rawHeaderBytes.size.toLong(), remainingToSend).toInt()
+                    if (headerWriteLen > 0) {
+                        out.write(rawHeaderBytes, 0, headerWriteLen)
+                        out.flush()
+                        remainingToSend -= headerWriteLen.toLong()
+                    }
+
+                    if (remainingToSend > 0L) {
+                        streamByteExactClustersLoop(
+                            reader = reader,
+                            out = out,
+                            ctx = ctx,
+                            transcoder = transcoder,
+                            initialClusterSize = firstClusterSize,
+                            initialClusterSizeRaw = firstClusterSizeRaw,
+                            startClusterFileOffset = firstClusterOffset,
+                            initialRemainingToSend = remainingToSend
+                        )
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    transcoder?.release()
                 }
-                // 4. Send HTTP 206 Partial Content headers with Accept-Ranges: bytes and Content-Range
-                // so Chromecast's Default Media Receiver enables the timeline seekbar and +/- 30s buttons!
+                return Pair(true, null)
+            }
+
+            // Fallback: v34's proven Streaming Mode (HTTP/1.1 200 OK, Accept-Ranges: none, unknown Segment size)
+            // Used ONLY for edge-case MKVs with unknown Segment/Cluster size, unknown file size, or no AAC encoder.
+            transcodedStreamUrls[streamKey] = true
+            try {
                 val httpHeaders = buildString {
-                    append("HTTP/1.1 206 Partial Content\r\n")
+                    append("HTTP/1.1 200 OK\r\n")
                     append("Content-Type: video/mp4\r\n")
                     append("icy-name: $streamTitle\r\n")
                     append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotalBytes\r\n")
+                    append("Accept-Ranges: none\r\n")
                     append("Access-Control-Allow-Origin: *\r\n")
                     append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
                     append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
@@ -4927,7 +5846,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
                 out.write(httpHeaders.toByteArray(Charsets.US_ASCII))
 
-                // 5. Write EBML Header + Segment (Unknown/Streaming Size) + Info + Rewritten Tracks
                 writeEbmlElement(out, 0x1A45DFA3L, ebmlBody)
                 writeEbmlId(out, 0x18538067L)
                 writeEbmlSize(out, -1L) // Unknown/streaming Segment size
@@ -4986,84 +5904,87 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             var clusterHasTimecode = false
             var hasFlushedFirstCluster = false
 
-                fun flushCurrentCluster() {
-                    if (clusterHasTimecode && outClusterBuf.size() > 0) {
-                        val bytes = outClusterBuf.toByteArray()
-                        outClusterBuf.reset()
-                        clusterHasTimecode = false
-                        hasFlushedFirstCluster = true
-                        writeEbmlId(out, 0x1F43B675L)
-                        writeEbmlSize(out, bytes.size.toLong())
-                        out.write(bytes)
-                        out.flush()
-                    } else {
-                        outClusterBuf.reset()
-                        clusterHasTimecode = false
-                    }
+            fun flushCurrentCluster() {
+                if (clusterHasTimecode && outClusterBuf.size() > 0) {
+                    val bytes = outClusterBuf.toByteArray()
+                    outClusterBuf.reset()
+                    clusterHasTimecode = false
+                    hasFlushedFirstCluster = true
+                    writeEbmlId(out, 0x1F43B675L)
+                    writeEbmlSize(out, bytes.size.toLong())
+                    out.write(bytes)
+                    out.flush()
+                } else {
+                    outClusterBuf.reset()
+                    clusterHasTimecode = false
                 }
+            }
 
-                fun ensureClusterTimecodeWritten(tc: Long) {
-                    if (!clusterHasTimecode) {
-                        currentClusterTimecode = tc.coerceAtLeast(0L)
-                        writeEbmlUintElement(outClusterBuf, 0xE7L, currentClusterTimecode)
-                        clusterHasTimecode = true
-                    }
+            fun ensureClusterTimecodeWritten(tc: Long) {
+                if (!clusterHasTimecode) {
+                    currentClusterTimecode = tc.coerceAtLeast(0L)
+                    writeEbmlUintElement(outClusterBuf, 0xE7L, currentClusterTimecode)
+                    clusterHasTimecode = true
                 }
+            }
 
-                fun processClusterBody(clusterByteSize: Long): Boolean {
-                    var bytesReadInCluster = 0L
-                    var sourceClusterTc = currentClusterTimecode
+            fun processClusterBody(clusterByteSize: Long): Boolean {
+                var bytesReadInCluster = 0L
+                var sourceClusterTc = currentClusterTimecode
 
-                    while (clusterByteSize < 0L || bytesReadInCluster < clusterByteSize) {
-                        val cId = reader.readElementId() ?: return false
-                        val cSz = reader.readElementSize() ?: return false
-                        bytesReadInCluster += cId.second + cSz.second
+                while (clusterByteSize < 0L || bytesReadInCluster < clusterByteSize) {
+                    val cId = reader.readElementId() ?: return false
+                    val cSz = reader.readElementSize() ?: return false
+                    bytesReadInCluster += cId.second + cSz.second
 
-                        // If indeterminate cluster size and we hit a new top-level Segment element, stop cluster
-                        if (clusterByteSize < 0L && (cId.first == 0x1F43B675L || cId.first == 0x1C53BB6BL || cId.first == 0x1254C367L)) {
-                            flushCurrentCluster()
-                            if (cId.first == 0x1F43B675L) {
-                                bytesReadInCluster = 0L
-                                continue
-                            } else {
-                                if (cSz.first > 0L) reader.skipExact(cSz.first)
-                                return true
-                            }
+                    if (clusterByteSize < 0L && (cId.first == 0x1F43B675L || cId.first == 0x1C53BB6BL || cId.first == 0x1254C367L)) {
+                        flushCurrentCluster()
+                        if (cId.first == 0x1F43B675L) {
+                            bytesReadInCluster = 0L
+                            continue
+                        } else {
+                            if (cSz.first > 0L) reader.skipExact(cSz.first)
+                            return true
                         }
+                    }
 
-                        val payloadLen = cSz.first
-                        if (payloadLen < 0L) return false
-                        bytesReadInCluster += payloadLen
+                    val payloadLen = cSz.first
+                    if (payloadLen < 0L) return false
+                    bytesReadInCluster += payloadLen
 
-                        when (cId.first) {
-                            0xE7L -> {
-                                // Cluster Timecode
-                                val tcBytes = reader.readExact(payloadLen.toInt()) ?: return false
-                                sourceClusterTc = readEbmlUint(tcBytes, 0, tcBytes.size)
-                                flushCurrentCluster()
-                                ensureClusterTimecodeWritten(sourceClusterTc)
-                            }
-                            0xA3L -> {
-                                // SimpleBlock
-                                if (payloadLen > 16_777_216L) {
-                                    if (!reader.skipExact(payloadLen)) return false
-                                } else {
-                                    val blockBytes = reader.readExact(payloadLen.toInt()) ?: return false
-                                    val hdr = parseMatroskaBlockHeader(blockBytes)
-                                    if (hdr != null) {
-                                        val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
-                                        if (videoTrackNumbers.contains(hdr.trackNumber)) {
-                                            val isKeyframe = (hdr.flags and 0x80) != 0
-                                            val flushThreshold = if (!hasFlushedFirstCluster) 49_152 else 196_608
-                                            // Only split a cluster mid-stream right before a Video Keyframe (IDR)
-                                            // or if relative timecode would approach Short.MAX_VALUE (30,000ms),
-                                            // so B-frames NEVER get negative relative timecodes in Chromium's WebMClusterParser!
-                                            if (clusterHasTimecode &&
-                                                ((isKeyframe && outClusterBuf.size() >= flushThreshold) ||
-                                                    (blockTimecode - currentClusterTimecode > 30_000L))
-                                            ) {
-                                                flushCurrentCluster()
-                                            }
+                    when (cId.first) {
+                        0xE7L -> {
+                            val tcBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                            sourceClusterTc = readEbmlUint(tcBytes, 0, tcBytes.size)
+                            flushCurrentCluster()
+                            ensureClusterTimecodeWritten(sourceClusterTc)
+                        }
+                        0xA3L -> {
+                            if (payloadLen > 16_777_216L) {
+                                if (!reader.skipExact(payloadLen)) return false
+                            } else {
+                                val blockBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                                val hdr = parseMatroskaBlockHeader(blockBytes)
+                                if (hdr != null) {
+                                    val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
+                                    if (videoTrackNumbers.contains(hdr.trackNumber)) {
+                                        val isKeyframe = (hdr.flags and 0x80) != 0
+                                        val flushThreshold = if (!hasFlushedFirstCluster) 49_152 else 196_608
+                                        if (clusterHasTimecode &&
+                                            ((isKeyframe && outClusterBuf.size() >= flushThreshold) ||
+                                                (blockTimecode - currentClusterTimecode > 30_000L))
+                                        ) {
+                                            flushCurrentCluster()
+                                        }
+                                        ensureClusterTimecodeWritten(blockTimecode)
+                                        val adjRel = (blockTimecode - currentClusterTimecode)
+                                            .coerceIn(0L, 32767L).toInt()
+                                        val vintLen = hdr.headerLen - 3
+                                        blockBytes[vintLen] = ((adjRel shr 8) and 0xFF).toByte()
+                                        blockBytes[vintLen + 1] = (adjRel and 0xFF).toByte()
+                                        writeEbmlElement(outClusterBuf, 0xA3L, blockBytes)
+                                    } else if (hdr.trackNumber == audioTrackNumber) {
+                                        if (transcoder == null) {
                                             ensureClusterTimecodeWritten(blockTimecode)
                                             val adjRel = (blockTimecode - currentClusterTimecode)
                                                 .coerceIn(0L, 32767L).toInt()
@@ -5071,61 +5992,59 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                             blockBytes[vintLen] = ((adjRel shr 8) and 0xFF).toByte()
                                             blockBytes[vintLen + 1] = (adjRel and 0xFF).toByte()
                                             writeEbmlElement(outClusterBuf, 0xA3L, blockBytes)
-                                        } else if (hdr.trackNumber == audioTrackNumber) {
-                                            if (transcoder == null) {
-                                                ensureClusterTimecodeWritten(blockTimecode)
-                                                val adjRel = (blockTimecode - currentClusterTimecode)
-                                                    .coerceIn(0L, 32767L).toInt()
-                                                val vintLen = hdr.headerLen - 3
-                                                blockBytes[vintLen] = ((adjRel shr 8) and 0xFF).toByte()
-                                                blockBytes[vintLen + 1] = (adjRel and 0xFF).toByte()
-                                                writeEbmlElement(outClusterBuf, 0xA3L, blockBytes)
-                                            } else {
-                                                val frames = unlaceMatroskaBlockFrames(blockBytes, hdr, chosenAudio.sampleStrippedBytes)
-                                                val basePtsUs = (blockTimecode * timecodeScaleNs) / 1000L
-                                                for ((fIdx, f) in frames.withIndex()) {
-                                                    val framePtsUs = basePtsUs + (fIdx * 21_333L)
-                                                    transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
-                                                        val outBlockTc = (outPtsUs * 1000L) / timecodeScaleNs
-                                                        ensureClusterTimecodeWritten(outBlockTc)
-                                                        val rel = (outBlockTc - currentClusterTimecode)
-                                                            .coerceIn(0L, 32767L).toShort()
-                                                        writeSimpleBlock(outClusterBuf, audioTrackNumber, rel, encodedAudio)
-                                                    }
+                                        } else {
+                                            val frames = unlaceMatroskaBlockFrames(blockBytes, hdr, chosenAudio.sampleStrippedBytes)
+                                            val basePtsUs = (blockTimecode * timecodeScaleNs) / 1000L
+                                            for ((fIdx, f) in frames.withIndex()) {
+                                                val framePtsUs = basePtsUs + (fIdx * 21_333L)
+                                                transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
+                                                    val outBlockTc = (outPtsUs * 1000L) / timecodeScaleNs
+                                                    ensureClusterTimecodeWritten(outBlockTc)
+                                                    val rel = (outBlockTc - currentClusterTimecode)
+                                                        .coerceIn(0L, 32767L).toShort()
+                                                    writeSimpleBlock(outClusterBuf, audioTrackNumber, rel, encodedAudio)
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            0xA0L -> {
-                                // BlockGroup
-                                if (payloadLen > 16_777_216L) {
-                                    if (!reader.skipExact(payloadLen)) return false
-                                } else {
-                                    val groupBytes = reader.readExact(payloadLen.toInt()) ?: return false
-                                    // Find 0xA1 (Block) inside BlockGroup
-                                    var gp = 0
-                                    var innerBlock: ByteArray? = null
-                                    var innerBlockOffset = -1
-                                    while (gp < groupBytes.size) {
-                                        val gId = readEbmlIdFromArray(groupBytes, gp, groupBytes.size) ?: break
-                                        gp += gId.second
-                                        val gSz = readEbmlSizeFromArray(groupBytes, gp, groupBytes.size) ?: break
-                                        gp += gSz.second
-                                        val gLen = gSz.first.toInt()
-                                        if (gLen < 0 || gp + gLen > groupBytes.size) break
-                                        if (gId.first == 0xA1L) {
-                                            innerBlockOffset = gp
-                                            innerBlock = groupBytes.copyOfRange(gp, gp + gLen)
-                                            break
-                                        }
-                                        gp += gLen
+                        }
+                        0xA0L -> {
+                            if (payloadLen > 16_777_216L) {
+                                if (!reader.skipExact(payloadLen)) return false
+                            } else {
+                                val groupBytes = reader.readExact(payloadLen.toInt()) ?: return false
+                                var gp = 0
+                                var innerBlock: ByteArray? = null
+                                var innerBlockOffset = -1
+                                while (gp < groupBytes.size) {
+                                    val gId = readEbmlIdFromArray(groupBytes, gp, groupBytes.size) ?: break
+                                    gp += gId.second
+                                    val gSz = readEbmlSizeFromArray(groupBytes, gp, groupBytes.size) ?: break
+                                    gp += gSz.second
+                                    val gLen = gSz.first.toInt()
+                                    if (gLen < 0 || gp + gLen > groupBytes.size) break
+                                    if (gId.first == 0xA1L) {
+                                        innerBlockOffset = gp
+                                        innerBlock = groupBytes.copyOfRange(gp, gp + gLen)
+                                        break
                                     }
-                                    val hdr = innerBlock?.let { parseMatroskaBlockHeader(it) }
-                                    if (hdr != null && innerBlock != null && innerBlockOffset >= 0) {
-                                        val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
-                                        if (videoTrackNumbers.contains(hdr.trackNumber)) {
+                                    gp += gLen
+                                }
+                                val hdr = innerBlock?.let { parseMatroskaBlockHeader(it) }
+                                if (hdr != null && innerBlock != null && innerBlockOffset >= 0) {
+                                    val blockTimecode = (sourceClusterTc + hdr.relTimecode).coerceAtLeast(0L)
+                                    if (videoTrackNumbers.contains(hdr.trackNumber)) {
+                                        ensureClusterTimecodeWritten(blockTimecode)
+                                        val adjRel = (blockTimecode - currentClusterTimecode)
+                                            .coerceIn(0L, 32767L).toInt()
+                                        val vintLen = hdr.headerLen - 3
+                                        groupBytes[innerBlockOffset + vintLen] = ((adjRel shr 8) and 0xFF).toByte()
+                                        groupBytes[innerBlockOffset + vintLen + 1] = (adjRel and 0xFF).toByte()
+                                        writeEbmlElement(outClusterBuf, 0xA0L, groupBytes)
+                                    } else if (hdr.trackNumber == audioTrackNumber) {
+                                        if (transcoder == null) {
                                             ensureClusterTimecodeWritten(blockTimecode)
                                             val adjRel = (blockTimecode - currentClusterTimecode)
                                                 .coerceIn(0L, 32767L).toInt()
@@ -5133,59 +6052,48 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                             groupBytes[innerBlockOffset + vintLen] = ((adjRel shr 8) and 0xFF).toByte()
                                             groupBytes[innerBlockOffset + vintLen + 1] = (adjRel and 0xFF).toByte()
                                             writeEbmlElement(outClusterBuf, 0xA0L, groupBytes)
-                                        } else if (hdr.trackNumber == audioTrackNumber) {
-                                            if (transcoder == null) {
-                                                ensureClusterTimecodeWritten(blockTimecode)
-                                                val adjRel = (blockTimecode - currentClusterTimecode)
-                                                    .coerceIn(0L, 32767L).toInt()
-                                                val vintLen = hdr.headerLen - 3
-                                                groupBytes[innerBlockOffset + vintLen] = ((adjRel shr 8) and 0xFF).toByte()
-                                                groupBytes[innerBlockOffset + vintLen + 1] = (adjRel and 0xFF).toByte()
-                                                writeEbmlElement(outClusterBuf, 0xA0L, groupBytes)
-                                            } else {
-                                                val frames = unlaceMatroskaBlockFrames(innerBlock, hdr, chosenAudio.sampleStrippedBytes)
-                                                val basePtsUs = (blockTimecode * timecodeScaleNs) / 1000L
-                                                for ((fIdx, f) in frames.withIndex()) {
-                                                    val framePtsUs = basePtsUs + (fIdx * 21_333L)
-                                                    transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
-                                                        val outBlockTc = (outPtsUs * 1000L) / timecodeScaleNs
-                                                        ensureClusterTimecodeWritten(outBlockTc)
-                                                        val rel = (outBlockTc - currentClusterTimecode)
-                                                            .coerceIn(0L, 32767L).toShort()
-                                                        writeSimpleBlock(outClusterBuf, audioTrackNumber, rel, encodedAudio)
-                                                    }
+                                        } else {
+                                            val frames = unlaceMatroskaBlockFrames(innerBlock, hdr, chosenAudio.sampleStrippedBytes)
+                                            val basePtsUs = (blockTimecode * timecodeScaleNs) / 1000L
+                                            for ((fIdx, f) in frames.withIndex()) {
+                                                val framePtsUs = basePtsUs + (fIdx * 21_333L)
+                                                transcoder.transcodeFrame(f, framePtsUs) { encodedAudio, outPtsUs ->
+                                                    val outBlockTc = (outPtsUs * 1000L) / timecodeScaleNs
+                                                    ensureClusterTimecodeWritten(outBlockTc)
+                                                    val rel = (outBlockTc - currentClusterTimecode)
+                                                        .coerceIn(0L, 32767L).toShort()
+                                                    writeSimpleBlock(outClusterBuf, audioTrackNumber, rel, encodedAudio)
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            else -> {
-                                if (!reader.skipExact(payloadLen)) return false
-                            }
+                        }
+                        else -> {
+                            if (!reader.skipExact(payloadLen)) return false
                         }
                     }
-                    flushCurrentCluster()
-                    return true
                 }
+                flushCurrentCluster()
+                return true
+            }
 
-                // Process the first Cluster
-                if (firstClusterSize != null) {
-                    if (!processClusterBody(firstClusterSize)) {
-                        return
-                    }
+            if (firstClusterSize != null) {
+                if (!processClusterBody(firstClusterSize)) {
+                    return
                 }
+            }
 
-                // Process all remaining Clusters in the Segment
-                while (true) {
-                    val nextId = reader.readElementId() ?: break
-                    val nextSz = reader.readElementSize() ?: break
-                    if (nextId.first == 0x1F43B675L) {
-                        if (!processClusterBody(nextSz.first)) break
-                    } else {
-                        if (nextSz.first < 0L || !reader.skipExact(nextSz.first)) break
-                    }
+            while (true) {
+                val nextId = reader.readElementId() ?: break
+                val nextSz = reader.readElementSize() ?: break
+                if (nextId.first == 0x1F43B675L) {
+                    if (!processClusterBody(nextSz.first)) break
+                } else {
+                    if (nextSz.first < 0L || !reader.skipExact(nextSz.first)) break
                 }
+            }
         }
 
         /**
@@ -7615,7 +8523,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // rewrites `/cast/stream.mp4` directly to TorrServer's real `.mkv`/`.mp4` file path anyway!
                     val streamExt = "mp4"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=35"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=36"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
