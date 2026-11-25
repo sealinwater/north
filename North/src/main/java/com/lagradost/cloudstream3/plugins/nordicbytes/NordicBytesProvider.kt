@@ -1065,14 +1065,22 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     )
                     ObjectAnimator.ofFloat(overlay, "alpha", 0f, 1f).setDuration(220L).start()
 
-                    // Keep the main content paused behind the overlay until the 2.65s intro completes
+                    // Keep the main content paused behind the overlay until the 2.65s intro completes.
+                    // If CloudStream applies a saved resume position (>3.5s) right after startup, dismiss immediately!
                     holdPauseTask = object : Runnable {
                         override fun run() {
                             if (dismissed) return
                             try {
                                 val p = playerFrag.player
-                                if (p != null && p.getIsPlaying()) {
-                                    p.handleEvent(CSPlayerEvent.Pause, PlayerEventSource.UI)
+                                if (p != null) {
+                                    val posNow = p.getPosition() ?: 0L
+                                    if (posNow > 3_500L) {
+                                        finishIntro()
+                                        return
+                                    }
+                                    if (p.getIsPlaying()) {
+                                        p.handleEvent(CSPlayerEvent.Pause, PlayerEventSource.UI)
+                                    }
                                 }
                             } catch (_: Throwable) {
                             }
@@ -2113,6 +2121,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
                 session.lastPeersResponse = ByteArray(0)
                 session.lastAnnounceMs = 0L
+                session.promotedToSeeder = false
                 val stopQuery = (
                     passthroughParams + listOf(
                         "uploaded=$finalUpload",
@@ -2133,7 +2142,14 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
 
-            if (session.lastPeersResponse.isNotEmpty()) {
+            // CRITICAL: Always fetch fresh peers on `event=started` or whenever cached peers are >5 minutes old!
+            // Returning an old cached peer list when resuming a saved stream hours later gives TorrServer stale/dead
+            // peers (and a 30-min tracker interval), leaving resumed streams stuck loading at 00:00!
+            val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
+                eventValue != "started" &&
+                (now - session.lastAnnounceMs) < 300_000L
+
+            if (cacheIsFresh) {
                 sendHttpResponse(sock, 200, "text/plain", session.lastPeersResponse)
                 if (now - session.lastAnnounceMs >= 120_000L) {
                     session.lastAnnounceMs = now
@@ -2161,6 +2177,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                 }
                 return
+            }
+
+            if (eventValue == "started" || (now - session.lastAnnounceMs) >= 300_000L) {
+                session.promotedToSeeder = false
             }
 
             // Initial peer discovery announce (`left > 0` so tracker returns ALL seedboxes!)
@@ -2246,28 +2266,59 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
          * Synchronized on `torrResolveLock` so parallel HTTP range connections from Chromecast/ExoPlayer never
          * re-add or reset the same torrent concurrently.
          */
+        private fun clearCachedStateForHash(hash: String) {
+            if (hash.isBlank()) return
+            for (entry in castStreamUrlCache.entries) {
+                if (entry.value.contains(hash, ignoreCase = true) || entry.key.contains(hash, ignoreCase = true)) {
+                    castStreamUrlCache.remove(entry.key)
+                }
+            }
+            for (entry in transcodedStreamContextMap.entries) {
+                if (entry.key.contains(hash, ignoreCase = true)) {
+                    transcodedStreamContextMap.remove(entry.key)
+                }
+            }
+            for (entry in transcodedStreamUrls.entries) {
+                if (entry.key.contains(hash, ignoreCase = true)) {
+                    transcodedStreamUrls.remove(entry.key)
+                }
+            }
+            for (entry in ghostSessions.entries) {
+                if (entry.key.contains(hash, ignoreCase = true)) {
+                    entry.value.lastPeersResponse = ByteArray(0)
+                    entry.value.lastAnnounceMs = 0L
+                    entry.value.promotedToSeeder = false
+                }
+            }
+        }
+
         private fun dropTorrServerHashAsync(hash: String) {
             if (hash.isBlank()) return
+            clearCachedStateForHash(hash)
             thread(isDaemon = true, name = "North-DropIdleTorrent") {
-                try {
-                    val baseUrl = resolveRunningTorrServerUrl()
-                    if (!isTorrServerAlive(baseUrl)) return@thread
-                    val conn = (URL("$baseUrl/torrents").openConnection() as HttpURLConnection).apply {
-                        requestMethod = "POST"
-                        doOutput = true
-                        setRequestProperty("Content-Type", "application/json")
-                        connectTimeout = 2500
-                        readTimeout = 2500
+                synchronized(torrResolveLock) {
+                    // Abort drop if user switched back to this exact torrent while the drop thread was queued!
+                    if (activeKeepAliveHash.equals(hash, ignoreCase = true)) return@synchronized
+                    try {
+                        val baseUrl = resolveRunningTorrServerUrl()
+                        if (!isTorrServerAlive(baseUrl)) return@synchronized
+                        val conn = (URL("$baseUrl/torrents").openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            doOutput = true
+                            setRequestProperty("Content-Type", "application/json")
+                            connectTimeout = 2500
+                            readTimeout = 2500
+                        }
+                        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
+                            it.write(JSONObject().apply {
+                                put("action", "drop")
+                                put("hash", hash)
+                            }.toString())
+                        }
+                        conn.responseCode
+                        conn.disconnect()
+                    } catch (_: Throwable) {
                     }
-                    OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
-                        it.write(JSONObject().apply {
-                            put("action", "drop")
-                            put("hash", hash)
-                        }.toString())
-                    }
-                    conn.responseCode
-                    conn.disconnect()
-                } catch (_: Throwable) {
                 }
             }
         }
@@ -2417,7 +2468,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (!forceReAdd) {
                 castStreamUrlCache[cacheKey]?.let { cached ->
                     val base = resolveRunningTorrServerUrl()
-                    if (cached.startsWith(base)) {
+                    val cachedHash = cached.substringAfter("link=", "").substringBefore("&").trim()
+                    val recentlyActive = cachedHash.isNotBlank() &&
+                        cachedHash.equals(activeKeepAliveHash, ignoreCase = true) &&
+                        (System.currentTimeMillis() - lastKeepAliveTouchMs) < 45_000L
+                    if (cached.startsWith(base) && recentlyActive) {
                         return cached
                     }
                 }
@@ -2428,11 +2483,30 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 if (!forceReAdd) {
                     castStreamUrlCache[cacheKey]?.let { cached ->
                         if (cached.startsWith(currentBase)) {
-                            return cached
+                            val cachedHash = cached.substringAfter("link=", "").substringBefore("&").trim()
+                            val recentlyActive = cachedHash.isNotBlank() &&
+                                cachedHash.equals(activeKeepAliveHash, ignoreCase = true) &&
+                                (System.currentTimeMillis() - lastKeepAliveTouchMs) < 45_000L
+                            if (recentlyActive) {
+                                return cached
+                            }
+                            // Verify TorrServer STILL holds this torrent with valid metadata/file_stats!
+                            // If it was dropped or timed out after idle, fall through to re-add via /torrents action=add.
+                            val status = queryTorrServerStatus(currentBase, cachedHash)
+                            val statCode = status?.optInt("stat", 0) ?: 0
+                            val fStats = status?.optJSONArray("file_stats")
+                            if (status != null && statCode > 0 && fStats != null && fStats.length() > 0) {
+                                return cached
+                            }
+                            clearCachedStateForHash(cachedHash)
+                            castStreamUrlCache.remove(cacheKey)
                         }
                     }
                 } else {
-                    castStreamUrlCache.remove(cacheKey)
+                    castStreamUrlCache.remove(cacheKey)?.let { oldUrl ->
+                        val oldHash = oldUrl.substringAfter("link=", "").substringBefore("&").trim()
+                        if (oldHash.isNotBlank()) clearCachedStateForHash(oldHash)
+                    }
                 }
 
                 // 1. Start TorrServer directly FIRST without calling Torrent.transformLink (no Engine reboot/public tracker spam)
@@ -8523,7 +8597,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // rewrites `/cast/stream.mp4` directly to TorrServer's real `.mkv`/`.mp4` file path anyway!
                     val streamExt = "mp4"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=36"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=37"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -8583,11 +8657,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
      * 1. Bypasses `CronetDataSource` (which has a hard 15s `setReadTimeoutMs(15000)` that throws
      *    `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT (2002)` during torrent piece waits) and uses
      *    `OkHttpDataSource` instead.
-     * 2. Directly rewrites `/cast/stream.(mkv|mp4)` requests from local ExoPlayer to TorrServer's native
+     * 2. ALWAYS rewrites `/cast/stream.(mkv|mp4)` requests from local ExoPlayer directly to TorrServer's native
      *    Go `http.ServeContent` URL (`http://127.0.0.1:<torrPort>/stream/<fname>?link=<hash>&index=<id>&play`)
-     *    with `CacheControl.FORCE_NETWORK` (bypassing `app.baseClient`'s 50 MB disk `http_cache`).
-     * 3. Keeps localhost HTTP keep-alive enabled so `CacheDataSource`'s 5 MB sequential spans reuse the
-     *    TorrServer socket cleanly while range seeks (>100ms remaining) automatically close the old stream.
+     *    with `CacheControl.FORCE_NETWORK` (regardless of `cast=1`/`cast=0`, since `getVideoInterceptor` ONLY
+     *    runs inside local on-device ExoPlayer and never on external Chromecast receivers!).
+     * 3. Uses a generous 90s read timeout and automatically re-adds the torrent & refreshes Ghost Ratio peers
+     *    on any HTTP 404/410/5xx or IO/timeout error so saved/resumed streams never hang loading!
      */
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
@@ -8597,28 +8672,29 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             var activeReq = req
             var castQueryForRetry: String? = null
+            var activeHash = ""
 
             if (urlStr.contains("/cast/stream")) {
                 val rawQuery = req.url.encodedQuery.orEmpty()
                 castQueryForRetry = rawQuery
-                if (req.url.queryParameter("cast") != "1") {
-                    val localPort = ensureLocalProxyServer()
-                    val resolvedTarget = resolveDirectTorrStreamFromCastQuery(
-                        rawQuery = rawQuery,
-                        localPort = localPort,
-                        forceReAdd = false
-                    )
-                    val directTorrUrl = resolvedTarget?.torrStreamUrl
-                    if (!directTorrUrl.isNullOrBlank()) {
-                        activeReq = req.newBuilder()
-                            .url(directTorrUrl)
-                            .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
-                            .header("Cache-Control", "no-store")
-                            .build()
-                    }
+                val localPort = ensureLocalProxyServer()
+                val resolvedTarget = resolveDirectTorrStreamFromCastQuery(
+                    rawQuery = rawQuery,
+                    localPort = localPort,
+                    forceReAdd = false
+                )
+                val directTorrUrl = resolvedTarget?.torrStreamUrl
+                activeHash = resolvedTarget?.infoHash.orEmpty()
+                if (!directTorrUrl.isNullOrBlank()) {
+                    activeReq = req.newBuilder()
+                        .url(directTorrUrl)
+                        .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                        .header("Cache-Control", "no-store")
+                        .build()
                 }
             } else if (urlStr.contains("/stream/")) {
                 castQueryForRetry = torrUrlToCastQueryMap[urlStr]
+                activeHash = urlStr.substringAfter("link=", "").substringBefore("&").trim()
                 activeReq = req.newBuilder()
                     .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
                     .header("Cache-Control", "no-store")
@@ -8627,30 +8703,42 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val timedChain = chain
                 .withConnectTimeout(30, TimeUnit.SECONDS)
-                .withReadTimeout(45, TimeUnit.SECONDS)
-                .withWriteTimeout(45, TimeUnit.SECONDS)
+                .withReadTimeout(90, TimeUnit.SECONDS)
+                .withWriteTimeout(90, TimeUnit.SECONDS)
 
-            val response = timedChain.proceed(activeReq)
-            if ((response.code == 404 || response.code == 410 || response.code >= 500) && !castQueryForRetry.isNullOrBlank()) {
+            fun retryWithFreshReAdd(): okhttp3.Response? {
+                val retryQuery = castQueryForRetry?.takeIf { it.isNotBlank() } ?: return null
+                if (activeHash.isNotBlank()) {
+                    clearCachedStateForHash(activeHash)
+                }
                 val localPort = ensureLocalProxyServer()
                 val refreshedTarget = resolveDirectTorrStreamFromCastQuery(
-                    rawQuery = castQueryForRetry,
+                    rawQuery = retryQuery,
                     localPort = localPort,
                     forceReAdd = true
                 )
-                val refreshedTorrUrl = refreshedTarget?.torrStreamUrl
-                if (!refreshedTorrUrl.isNullOrBlank()) {
-                    try {
-                        response.close()
-                    } catch (_: Throwable) {
-                    }
-                    val retryReq = req.newBuilder()
-                        .url(refreshedTorrUrl)
-                        .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
-                        .header("Cache-Control", "no-store")
-                        .build()
-                    return@Interceptor timedChain.proceed(retryReq)
+                val refreshedTorrUrl = refreshedTarget?.torrStreamUrl?.takeIf { it.isNotBlank() } ?: return null
+                val retryReq = req.newBuilder()
+                    .url(refreshedTorrUrl)
+                    .cacheControl(okhttp3.CacheControl.FORCE_NETWORK)
+                    .header("Cache-Control", "no-store")
+                    .build()
+                return timedChain.proceed(retryReq)
+            }
+
+            val response = try {
+                timedChain.proceed(activeReq)
+            } catch (ioe: java.io.IOException) {
+                retryWithFreshReAdd() ?: throw ioe
+            }
+
+            if ((response.code == 404 || response.code == 410 || response.code >= 500) && !castQueryForRetry.isNullOrBlank()) {
+                try {
+                    response.close()
+                } catch (_: Throwable) {
                 }
+                val retried = retryWithFreshReAdd()
+                if (retried != null) return@Interceptor retried
             }
             response
         }
