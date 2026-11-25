@@ -11,7 +11,7 @@ const port = Number(
   process.env.DEFAULT_APP_PORT ||
     (Number.isFinite(rawEnvPort) && rawEnvPort > 0 && rawEnvPort !== 8080 ? rawEnvPort : 3000)
 );
-const PLUGIN_VERSION = 32;
+const PLUGIN_VERSION = 38;
 
 interface CacheEntry<T> {
   expiresAt: number;
@@ -428,7 +428,7 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, {
       name: 'North (Account API Key Required)',
       description:
-        'North • Deep Blue Nordic & Danish Cloudstream Extension (by sealinwater). ⚠️ ACCOUNT API KEY REQUIRED: Requires a NordicBytes account & UNIT3D API Key to work. Apply at https://nordicbytes.org/application (application text is public for community vouching — never include real name/PII; email & 2 tracker proof screenshot/profile URLs are staff-only), then copy your API key from Profile -> Settings -> API Key into North Settings.',
+        "North • Nordic & Danish Cloudstream Extension (by sealinwater). ⚠️ ACCOUNT API KEY REQUIRED: You need a NordicBytes account and UNIT3D API key to use North. Apply at https://nordicbytes.org/application (your application text is public so members can vouch for you, so don't include your real name or personal info; your email and 2 tracker proof screenshot/profile links are only visible to staff), then copy your API key from Profile -> Settings -> API Key into North Settings.",
       iconUrl: 'https://raw.githubusercontent.com/sealinwater/north/builds/icon.png',
       manifestVersion: 1,
       pluginLists: [`${baseUrl}/plugins.json`]
@@ -455,7 +455,7 @@ const server = http.createServer(async (req, res) => {
         internalName: 'North',
         authors: ['North • sealinwater'],
         description:
-          '⚠️ ACCOUNT API KEY REQUIRED: North requires a NordicBytes (nordicbytes.org) account & API Key to work. HOW TO SIGN UP & GET A KEY: 1) Apply at https://nordicbytes.org/application — your application text & experience level are public for community vouching (NEVER include your real name, address, or personal info!), while your email and at least 2 tracker proof screenshots + profile URLs are staff-only (required; no proof = rejection). 2) Once logged in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API Token. 3) Open Cloudstream -> Settings -> Extensions -> North (Gear Icon), paste your key, and Save.',
+          '⚠️ ACCOUNT API KEY REQUIRED: You need a NordicBytes (nordicbytes.org) account and API key to use North. How to get set up: 1) Apply at https://nordicbytes.org/application. Everything you write in your application text and experience level is public so members can vouch for you, so never put your real name, address, or personal info in there. Your email and at least 2 tracker proof screenshots + profile links are only shown to staff (you do need proofs or the application gets rejected). 2) Once you can log in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API token. 3) In Cloudstream, go to Settings -> Extensions -> North (gear icon), paste your key, and hit Save.',
         iconUrl: 'https://raw.githubusercontent.com/sealinwater/north/builds/icon.png',
         fileSize: fileSize,
         apiVersion: 1
@@ -554,7 +554,7 @@ const server = http.createServer(async (req, res) => {
             </div>
             <h1 class="text-3xl font-extrabold text-white tracking-tight">North • Cloudstream Extension & Proxy API</h1>
             <p class="text-blue-200/80 mt-2 text-sm sm:text-base">
-                Deep Blue Nordic Movies & Series extension + companion Proxy API server — featuring pre-roll NORTH studio intro, seekable MKV/MP4 streaming, Chromecast stereo transcoding, skip timestamps API, and Ghost Ratio protection.
+                Nordic Movies & Series extension + companion Proxy API server with the Nordic Aurora intro, seekable MKV/MP4 streaming, Chromecast stereo audio support, skip intro buttons, and Ghost Ratio protection.
             </p>
             <div class="mt-6 flex flex-wrap gap-3">
                 <a href="${cloudstreamProtocolUrl}" 
@@ -574,21 +574,21 @@ const server = http.createServer(async (req, res) => {
 
         <div class="bg-[#08152B] border border-amber-500/40 rounded-2xl p-6 space-y-4 shadow-xl">
             <div class="flex items-center justify-between">
-                <h2 class="text-lg font-bold text-white">⚠️ Account API Key Required — How to Sign Up &amp; Get Your Key</h2>
+                <h2 class="text-lg font-bold text-white">⚠️ Account API Key Required: How to Sign Up &amp; Get Your Key</h2>
                 <span class="text-xs font-semibold px-2.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-400/30">Required</span>
             </div>
             <p class="text-xs sm:text-sm text-blue-100/85">
-                <b>North</b> requires an active <b>NordicBytes</b> (<code class="text-sky-300">nordicbytes.org</code>) account and personal UNIT3D API Token to function. Follow these steps to apply and get your key:
+                <b>North</b> needs an active <b>NordicBytes</b> (<code class="text-sky-300">nordicbytes.org</code>) account and your personal UNIT3D API token to work. Here is how to apply and grab your key:
             </p>
             <div class="space-y-3 text-xs text-blue-100/80">
                 <div class="bg-[#040B16] border border-blue-900/70 rounded-xl p-4 space-y-1.5">
                     <div class="font-semibold text-sky-300 text-sm">1. Apply to Join at <a href="https://nordicbytes.org/application" target="_blank" class="underline hover:text-white">https://nordicbytes.org/application</a></div>
                     <ul class="list-disc list-inside space-y-1 text-blue-200/80">
-                        <li><b>Your Application is Public:</b> Everything you write in your application text and your experience level (e.g. <i>&ldquo;New — I haven’t used private trackers before&rdquo;</i> or experienced) is visible to every member of the community. Members read it to decide whether to vouch for you. Be honest, be specific, and make it count.</li>
-                        <li><b class="text-amber-300">No Personal Information:</b> Do NOT, under any circumstance, include your real name, address, or any other personal identifiable information.</li>
-                        <li><b>Where Are You From? (Anonymous):</b> Optional — shown alongside your application.</li>
+                        <li><b>Your Application is Public:</b> Whatever you write in your application text and your experience level (like <i>&ldquo;New, I haven't used private trackers before&rdquo;</i> or experienced) is visible to all members on the site so they can vouch for you. Just be honest and write a clear answer.</li>
+                        <li><b class="text-amber-300">No Personal Information:</b> Never put your real name, home address, or any other private personal info in your application.</li>
+                        <li><b>Where Are You From? (Anonymous):</b> Optional, shown next to your application.</li>
                         <li><b>Email Address (Staff Only):</b> Only visible to staff.</li>
-                        <li><b>Proof (Staff Only — Required):</b> Provide at least 2 screenshots (<code>Screenshot URL</code> + <code>Profile URL</code>) showing your tracker membership — username, ratio, and upload/download. <i>Required; no proof = automatic rejection.</i></li>
+                        <li><b>Proof (Staff Only, Required):</b> Add at least 2 screenshots (<code>Screenshot URL</code> + <code>Profile URL</code>) showing your profile on another tracker with your username, ratio, and upload/download stats. <i>You need proof or the application gets rejected.</i></li>
                     </ul>
                 </div>
                 <div class="bg-[#040B16] border border-blue-900/70 rounded-xl p-4 space-y-1">

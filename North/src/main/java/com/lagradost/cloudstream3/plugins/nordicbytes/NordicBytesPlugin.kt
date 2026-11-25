@@ -128,12 +128,14 @@ class NordicBytesPlugin : Plugin() {
         NordicBytesProvider.playNorthIntroEnabled = prefs.getBoolean("play_north_intro", true)
         NordicBytesProvider.proxyApiBaseUrl = (prefs.getString("proxy_api_url", NordicBytesProvider.DEFAULT_PROXY_API_URL)
             ?: NordicBytesProvider.DEFAULT_PROXY_API_URL).trim().trimEnd('/')
-        if (prefs.getInt("exo_cache_purged_version", 0) < 32) {
+        if (prefs.getInt("exo_cache_purged_version", 0) < 33) {
             try {
                 File(appContext.cacheDir, "exoplayer").deleteRecursively()
+                File(appContext.cacheDir, "http_cache").deleteRecursively()
+                File(appContext.cacheDir, "north_intro.mp4").delete()
             } catch (_: Throwable) {
             }
-            prefs.edit().putInt("exo_cache_purged_version", 32).apply()
+            prefs.edit().putInt("exo_cache_purged_version", 33).apply()
         }
         NordicBytesProvider.purgeStaleExoPlayerSimpleCache()
         NordicBytesProvider.registerNorthSkipApi()
@@ -330,7 +332,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V32"
+            text = "NORTH • SEALINWATER • V38"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
@@ -495,7 +497,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val guideTitle = TextView(context).apply {
-            text = "🔑 Account Key Required — Application & Key Guide"
+            text = "🔑 Account Key Required: How to Sign Up & Get Your Key"
             textSize = 12.5f
             setTextColor(Color.WHITE)
             typeface = Typeface.DEFAULT_BOLD
@@ -506,13 +508,13 @@ class NordicBytesPlugin : Plugin() {
         val guideSteps = TextView(context).apply {
             text = buildString {
                 append("1. Apply at https://nordicbytes.org/application\n")
-                append("   • Public Vouching: Your application text & experience level (e.g. \"New — I haven’t used private trackers before\") are visible to all community members who decide whether to vouch for you. Be honest & specific — NEVER include your real name, address, or personal identifiable info!\n")
-                append("   • Staff-Only Fields: Your email address and proof links are visible only to staff.\n")
-                append("   • Required Proofs: Include at least 2 screenshots (Screenshot URL + Profile URL) showing your tracker membership (username, ratio, upload/download). No proof = automatic rejection.\n\n")
-                append("2. Get Your API Key (Already have an account?)\n")
-                append("   • Log in at nordicbytes.org → open Profile → Settings → API Key / Security and copy your UNIT3D API Token.\n\n")
-                append("3. Activate in North\n")
-                append("   • Paste your API Token into the box above and tap \"Save & Restart CloudStream\" (or search apikey:YOUR_TOKEN).")
+                append("   • Public Vouching: Your application text and experience level (like \"New, I haven't used private trackers before\") are visible to all members so they can vouch for you. Just be honest and specific, and don't put your real name, home address, or personal info in there.\n")
+                append("   • Staff-Only Fields: Your email address and proof links are only seen by staff.\n")
+                append("   • Required Proofs: Add at least 2 screenshots (Screenshot URL + Profile URL) showing your tracker profile (username, ratio, upload/download). Applications without proof get rejected.\n\n")
+                append("2. Grab Your API Key (Already have an account?)\n")
+                append("   • Log in at nordicbytes.org, go to Profile -> Settings -> API Key / Security, and copy your UNIT3D API token.\n\n")
+                append("3. Add It to North\n")
+                append("   • Paste your API token into the box above and tap \"Save & Restart CloudStream\" (or search apikey:YOUR_TOKEN).")
             }
             textSize = 10.5f
             setTextColor(Color.parseColor("#DBEAFE"))

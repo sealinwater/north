@@ -1,8 +1,8 @@
-version = 32
+version = 38
 
 cloudstream {
     authors = listOf("North • sealinwater")
-    description = "⚠️ ACCOUNT API KEY REQUIRED: North requires a NordicBytes (nordicbytes.org) account & API Key to work. HOW TO SIGN UP & GET A KEY: 1) Apply at https://nordicbytes.org/application — your application text & experience level are public for community vouching (NEVER include your real name, address, or personal info!), while your email and at least 2 tracker proof screenshots + profile URLs are staff-only (required; no proof = rejection). 2) Once logged in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API Token. 3) Open Cloudstream -> Settings -> Extensions -> North (Gear Icon), paste your key, and Save. Features NORTH Studio Intro, Companion Proxy API, Seekable MKV/MP4 Streaming, Chromecast Stereo AAC Transcoding, TheIntroDB Skip Buttons & Ghost Ratio Protection."
+    description = "⚠️ ACCOUNT API KEY REQUIRED: You need a NordicBytes (nordicbytes.org) account and API key to use North. How to get set up: 1) Apply at https://nordicbytes.org/application. Everything you write in your application text and experience level is public so members can vouch for you, so never put your real name, address, or personal info in there. Your email and at least 2 tracker proof screenshots + profile links are only shown to staff (you do need proofs or the application gets rejected). 2) Once you can log in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API token. 3) In Cloudstream, go to Settings -> Extensions -> North (gear icon), paste your key, and hit Save. Includes the Nordic Aurora intro, seekable MKV/MP4 playback, Chromecast stereo audio support, skip intro buttons, and Ghost Ratio protection."
     iconUrl = "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png"
     language = "da"
     tvTypes = listOf("Movie", "TvSeries", "Anime", "Documentary")
