@@ -1639,7 +1639,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         pathOnly == "/cast" || pathOnly.startsWith("/cast/") || pathOnly.startsWith("/api/cast/") ->
                             handleProxyCastStream(sock, method, rawQuery, requestHeaders, localPort)
                         pathOnly == "/sub" || pathOnly.startsWith("/sub/") || pathOnly == "/api/sub" || pathOnly.startsWith("/api/sub/") ->
-                            handleProxySubtitle(sock, method, rawQuery)
+                            handleProxySubtitle(sock, method, rawQuery, requestHeaders)
                         else -> sendHttpResponse(sock, 404, "text/plain", "Not Found".toByteArray())
                     }
                 } catch (_: Exception) {
@@ -2766,23 +2766,17 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 } catch (_: Throwable) {
                     false
                 }
-                val isVlcClient = ua.contains("VLC", ignoreCase = true) || ua.contains("LibVLC", ignoreCase = true)
-                val isCloudStreamInternalExoPlayerUA = ua.contains("Windows NT 10.0", ignoreCase = true) && !ua.contains("CrKey", ignoreCase = true)
-                val isExternalPlayersUA = isVlcClient ||
-                    isCloudStreamInternalExoPlayerUA ||
-                    ua.contains("Lavf", ignoreCase = true) ||
-                    ua.contains("ExoPlayer", ignoreCase = true) ||
-                    ua.contains("MediaPlayer", ignoreCase = true) ||
-                    ua.contains("mpv", ignoreCase = true)
                 val isCastReceiverUA = ua.contains("CrKey", ignoreCase = true) ||
                     ua.contains("Chromecast", ignoreCase = true) ||
                     ua.contains("Cast", ignoreCase = true) ||
                     ua.contains("Fuchsia", ignoreCase = true) ||
                     ua.contains("GoogleTV", ignoreCase = true)
-                val isChromecastRequest = isCastReceiverUA || (explicitCastQuery && isExternalLanClient) || (isExternalLanClient && !isExternalPlayersUA)
+                // CRITICAL: ANY request arriving from another device on the LAN (`isExternalLanClient == true`)
+                // or from a Cast receiver MUST be served directly over LAN HTTP and NEVER redirected to 127.0.0.1:8090!
+                val isChromecastRequest = isExternalLanClient || isCastReceiverUA || explicitCastQuery
 
-                // Direct TorrServer redirect for all local players (ExoPlayer, VLC, mpv, JustPlayer, MX Player):
-                // eliminates the middleman socket proxy so TorrServer's Go net/http engine receives instant TCP FIN
+                // Direct TorrServer redirect ONLY for local on-device players (ExoPlayer, VLC, mpv, JustPlayer, MX Player):
+                // eliminates the middleman socket proxy on the phone so TorrServer's Go net/http engine receives instant TCP FIN
                 // on every seek/scrub and handles Matroska Cues range requests natively.
                 if (!isChromecastRequest) {
                     val out = BufferedOutputStream(sock.getOutputStream(), 4096)
@@ -2811,17 +2805,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     requestedEndInclusive = spec.substringAfter("-", "").trim().toLongOrNull() ?: -1L
                 }
 
-                if (isChromecastRequest && requestedStartOffset > 0L && transcodedStreamUrls.containsKey(torrStreamUrl)) {
-                    val out = sock.getOutputStream()
-                    val hdr = buildString {
-                        append("HTTP/1.1 416 Requested Range Not Satisfiable\r\n")
-                        append("Accept-Ranges: none\r\n")
-                        append("Access-Control-Allow-Origin: *\r\n")
-                        append("Connection: close\r\n\r\n")
-                    }
-                    out.write(hdr.toByteArray(Charsets.US_ASCII))
-                    out.flush()
-                    return
+                // If a Chromecast receiver probes a non-zero byte range on a live-transcoded stream,
+                // reset the range to start from offset 0 (HTTP 200 OK with Accept-Ranges: none) instead of
+                // returning HTTP 416, because HTTP 416 causes Chromium's MultibufferDataSource on Chromecast
+                // to immediately abort playback with MEDIA_ERR_NETWORK!
+                val forceTranscodedRestartFromZero = isChromecastRequest &&
+                    requestedStartOffset > 0L &&
+                    transcodedStreamUrls.containsKey(torrStreamUrl)
+                if (forceTranscodedRestartFromZero) {
+                    requestedStartOffset = 0L
+                    requestedEndInclusive = -1L
                 }
 
                 fun openTorrConnection(streamUrl: String, rangeHeaderValue: String?, readTimeoutMs: Int): HttpURLConnection {
@@ -2883,7 +2876,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 // Allow generous read timeout on forward/EOF seek requests (including 16 MiB season-pack pieces)
                 val initialReadTimeout = if (requestedStartOffset > 0L) 60000 else 30000
                 // Ensure Range requests always receive HTTP 206 Partial Content with Content-Range from TorrServer
-                val effectiveUpstreamRange = clientRangeHeader ?: if (!isChromecastRequest) "bytes=0-" else null
+                // unless this is a live-transcoded Chromecast stream where we must stream sequentially from byte 0.
+                val effectiveUpstreamRange = if (forceTranscodedRestartFromZero) {
+                    null
+                } else {
+                    clientRangeHeader ?: if (!isChromecastRequest) "bytes=0-" else null
+                }
                 upstreamConn = openTorrConnection(torrStreamUrl, effectiveUpstreamRange, initialReadTimeout)
                 var code = try {
                     upstreamConn.responseCode
@@ -2934,8 +2932,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                 }
 
-                // If client did not send a Range header, normalize status to 200 OK and omit Content-Range
-                if (clientRangeHeader.isNullOrBlank() && code == 206 && startByteOffset == 0L) {
+                // If client did not send a Range header (or we forced a live-transcode restart from 0),
+                // normalize status to 200 OK and omit Content-Range.
+                if ((clientRangeHeader.isNullOrBlank() || forceTranscodedRestartFromZero) && code == 206 && startByteOffset == 0L) {
                     code = 200
                     contentRange = null
                 }
@@ -4844,18 +4843,47 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         /**
-         * `/sub` CORS Subtitle Proxy Route so Chromecast (`castSession`) and ExoPlayer can load
-         * OpenSubtitles tracks with `Access-Control-Allow-Origin: *`, in-memory caching, and
-         * non-blocking empty-SRT fallback (preventing `SingleSampleMediaPeriod` 502 retry stalls
-         * inside `MergingMediaPeriod`).
+         * Converts SubRip (`.srt`) subtitle text into WebVTT (`.vtt`) format so Chromecast's
+         * Default Media Receiver (`shaka` / `cast.framework.PlayerManager`) and HTML5 `<track>`
+         * elements can render subtitles natively alongside local ExoPlayer.
          */
-        private fun handleProxySubtitle(sock: Socket, method: String, rawQuery: String) {
+        private fun convertSrtBytesToWebVtt(rawBytes: ByteArray): ByteArray {
+            val text = try {
+                String(rawBytes, Charsets.UTF_8)
+            } catch (_: Throwable) {
+                return "WEBVTT\n\n".toByteArray(Charsets.UTF_8)
+            }
+            val clean = text.removePrefix("\uFEFF").replace("\r\n", "\n").replace("\r", "\n").trim()
+            if (clean.startsWith("WEBVTT", ignoreCase = true)) {
+                return clean.toByteArray(Charsets.UTF_8)
+            }
+            val vttTimestampRegex = Regex("""(\d{1,2}:\d{2}:\d{2}),(\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}),(\d{3})""")
+            val convertedBody = vttTimestampRegex.replace(clean) { m ->
+                "${m.groupValues[1]}.${m.groupValues[2]} --> ${m.groupValues[3]}.${m.groupValues[4]}"
+            }
+            return "WEBVTT\n\n$convertedBody\n".toByteArray(Charsets.UTF_8)
+        }
+
+        /**
+         * `/sub` CORS Subtitle Proxy Route so Chromecast (`castSession`) and ExoPlayer can load
+         * OpenSubtitles tracks with `Access-Control-Allow-Origin: *`, in-memory caching, automatic
+         * SRT-to-WebVTT conversion for Cast receivers, and non-blocking empty-subtitle fallback
+         * (preventing `SingleSampleMediaPeriod` 502 retry stalls inside `MergingMediaPeriod`).
+         */
+        private fun handleProxySubtitle(
+            sock: Socket,
+            method: String,
+            rawQuery: String,
+            requestHeaders: Map<String, String> = emptyMap()
+        ) {
             var subUrl = ""
+            var fmt = ""
             for (pair in rawQuery.split("&")) {
                 val k = pair.substringBefore("=")
                 val v = pair.substringAfter("=", "")
-                if (k == "url") {
-                    subUrl = safeUrlDecode(v)
+                when (k) {
+                    "url" -> subUrl = safeUrlDecode(v)
+                    "fmt" -> fmt = safeUrlDecode(v).lowercase(Locale.ROOT)
                 }
             }
             if (!subUrl.startsWith("http")) {
@@ -4863,20 +4891,54 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 return
             }
 
-            subtitleResponseCache[subUrl]?.let { cached ->
-                sendHttpResponse(sock, 200, cached.first, cached.second)
-                return
+            val ua = requestHeaders["user-agent"].orEmpty()
+            val hasCorsOrigin = !requestHeaders["origin"].isNullOrBlank()
+            val isRemoteLanClient = try {
+                val remoteAddr = sock.inetAddress
+                val localAddr = sock.localAddress
+                val remoteHost = remoteAddr?.hostAddress.orEmpty()
+                val localHost = localAddr?.hostAddress.orEmpty()
+                remoteAddr != null &&
+                    !remoteAddr.isLoopbackAddress &&
+                    remoteHost != "127.0.0.1" &&
+                    remoteHost != "::1" &&
+                    remoteHost != localHost &&
+                    remoteHost != getLocalLanIpAddress()
+            } catch (_: Throwable) {
+                false
             }
+            val wantsWebVtt = fmt == "vtt" ||
+                subUrl.endsWith(".vtt", ignoreCase = true) ||
+                hasCorsOrigin ||
+                isRemoteLanClient ||
+                ua.contains("CrKey", ignoreCase = true) ||
+                ua.contains("Chromecast", ignoreCase = true) ||
+                ua.contains("Fuchsia", ignoreCase = true)
 
-            val fallbackType = if (subUrl.endsWith(".vtt", ignoreCase = true)) {
+            val outContentType = if (wantsWebVtt) {
                 "text/vtt; charset=utf-8"
             } else {
                 "application/x-subrip; charset=utf-8"
             }
-            val fallbackBody = if (subUrl.endsWith(".vtt", ignoreCase = true)) {
+            val fallbackBody = if (wantsWebVtt) {
                 "WEBVTT\n\n".toByteArray(Charsets.UTF_8)
             } else {
                 ByteArray(0)
+            }
+
+            val cacheKey = "$subUrl|vtt=$wantsWebVtt"
+            subtitleResponseCache[cacheKey]?.let { cached ->
+                sendHttpResponse(sock, 200, cached.first, cached.second)
+                return
+            }
+
+            val rawSrtCacheKey = "$subUrl|raw"
+            val existingRawBytes = subtitleResponseCache[rawSrtCacheKey]?.second
+            if (existingRawBytes != null && existingRawBytes.isNotEmpty()) {
+                val outBytes = if (wantsWebVtt) convertSrtBytesToWebVtt(existingRawBytes) else existingRawBytes
+                subtitleResponseCache[cacheKey] = Pair(outContentType, outBytes)
+                sendHttpResponse(sock, 200, outContentType, outBytes)
+                return
             }
 
             try {
@@ -4893,14 +4955,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     if (subtitleResponseCache.size > 40) {
                         subtitleResponseCache.clear()
                     }
-                    subtitleResponseCache[subUrl] = Pair(fallbackType, bytes)
-                    sendHttpResponse(sock, 200, fallbackType, bytes)
+                    subtitleResponseCache[rawSrtCacheKey] = Pair("application/x-subrip; charset=utf-8", bytes)
+                    val outBytes = if (wantsWebVtt) convertSrtBytesToWebVtt(bytes) else bytes
+                    subtitleResponseCache[cacheKey] = Pair(outContentType, outBytes)
+                    sendHttpResponse(sock, 200, outContentType, outBytes)
                 } else {
                     conn.disconnect()
-                    sendHttpResponse(sock, 200, fallbackType, fallbackBody)
+                    sendHttpResponse(sock, 200, outContentType, fallbackBody)
                 }
             } catch (_: Exception) {
-                sendHttpResponse(sock, 200, fallbackType, fallbackBody)
+                sendHttpResponse(sock, 200, outContentType, fallbackBody)
             }
         }
 
@@ -5621,7 +5685,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             )
 
             val localPort = ensureLocalProxyServer()
-            val subHost = if (useLanIp) getLocalLanIpAddress() else "127.0.0.1"
+            val lanIp = getLocalLanIpAddress()
+            val subHost = if (lanIp != "127.0.0.1") lanIp else "127.0.0.1"
             val countByLang = HashMap<String, Int>()
             for (sub in subList) {
                 val code = sub.lang?.trim()?.lowercase(Locale.ROOT) ?: continue
@@ -7080,7 +7145,13 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             val localPort = ensureLocalProxyServer()
-            val streamHost = if (castingNow) getLocalLanIpAddress() else "127.0.0.1"
+            val lanIp = getLocalLanIpAddress()
+            // Always emit a LAN-routable host IP (e.g. 192.168.1.x) when connected to Wi-Fi/LAN so that
+            // starting a Chromecast, Google TV, FCast, or WebVideoCast session AFTER loadLinks() has
+            // already populated ResultViewModel2's link cache still sends a valid LAN URL to the TV!
+            // On the phone itself, local ExoPlayer's `getVideoInterceptor` intercepts `/cast/stream`
+            // regardless of host IP and rewrites directly to `http://127.0.0.1:<torrPort>/stream/...`.
+            val streamHost = if (lanIp != "127.0.0.1") lanIp else "127.0.0.1"
             try {
                 Torrent.hasAcceptedTorrentForThisSession = true
             } catch (_: Throwable) {
@@ -7189,11 +7260,13 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
 
                     val castFlag = if (castingNow) "1" else "0"
-                    val isMkvFile = parsedMeta?.files?.getOrNull(exactFileIndex - 1)?.first?.endsWith(".mkv", ignoreCase = true)
-                        ?: !displayTitle.contains(".mp4", ignoreCase = true)
-                    val streamExt = if (castingNow || !isMkvFile) "mp4" else "mkv"
+                    // Always use `.mp4` path suffix on `/cast/stream.mp4` so Chromecast's Default Media Receiver
+                    // (`CastHelper.getMediaInfo` -> `MimeTypes.VIDEO_MP4`) never rejects the URL if the user taps
+                    // the Cast button after `loadLinks()` already ran. For local ExoPlayer, `getVideoInterceptor`
+                    // rewrites `/cast/stream.mp4` directly to TorrServer's real `.mkv`/`.mp4` file path anyway!
+                    val streamExt = "mp4"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=33"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=34"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
