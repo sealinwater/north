@@ -617,10 +617,28 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         @Volatile
         private var lastIntroPlayerIdentity: Int = 0
 
+        @Volatile
+        private var lastIntroMediaKey: String = ""
+
+        @Volatile
+        private var isCastProgressThreadRunning: Boolean = false
+
+        private data class TranscodedCastStreamContext(
+            val ebmlHeaderBody: ByteArray,
+            val infoBody: ByteArray?,
+            val timecodeScaleNs: Long,
+            val videoTracks: List<MkvTrackInfo>,
+            val chosenAudio: MkvTrackInfo,
+            val durationMs: Double,
+            val totalFileBytes: Long,
+            val firstClusterOffset: Long
+        )
+
         private val proxyLock = Any()
         private val torrResolveLock = Any()
         private val introDownloadLock = Any()
         private val transcodedStreamUrls = ConcurrentHashMap<String, Boolean>()
+        private val transcodedStreamContextMap = ConcurrentHashMap<String, TranscodedCastStreamContext>()
         private val mkvCuesTailCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
         private val mkvCuesTailWarmInProgress = ConcurrentHashMap<String, Boolean>()
         private val torrUrlToCastQueryMap = ConcurrentHashMap<String, String>()
@@ -747,12 +765,13 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
         /**
          * Displays the branded full-screen **NORTH** intro (video + crisp native title card)
-         * as content begins to load/play inside CloudStream's player, pausing the underlying episode
-         * cleanly for ~2.6s and resuming playback seamlessly without calling `seekTo(0L)` (which would
-         * abort `UpdatedMatroskaExtractor`'s initial EOF Cues seek).
+         * every time a new movie or episode starts playing inside CloudStream's player, pausing the
+         * underlying episode cleanly for ~2.6s and resuming playback seamlessly without calling `seekTo(0L)`
+         * (which would abort `UpdatedMatroskaExtractor`'s initial EOF Cues seek).
          */
-        fun triggerNorthIntroPreRoll(isCastingNow: Boolean) {
+        fun triggerNorthIntroPreRoll(isCastingNow: Boolean, mediaKey: String = "") {
             if (isCastingNow || !playNorthIntroEnabled || isIntroOverlayActive) return
+            ensureCastProgressMonitorRunning()
             precacheNorthIntroAsync()
 
             val mainHandler = Handler(Looper.getMainLooper())
@@ -779,22 +798,25 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
 
                     val fragId = System.identityHashCode(playerFrag)
-                    if (fragId == lastIntroPlayerIdentity) return
+                    val effectiveMediaKey = mediaKey.ifBlank { "frag:$fragId" }
+                    if (fragId == lastIntroPlayerIdentity && effectiveMediaKey == lastIntroMediaKey) return
 
-                    // Check if playback is already actively past 1.5s (e.g., Continue Watching resume or already playing);
-                    // if so, mark this fragment identity and skip the pre-roll so we NEVER pause or seek backward!
+                    // Check if playback is already actively past 3.5s (e.g., Continue Watching resume mid-episode);
+                    // if so, mark this media key and skip the pre-roll so we NEVER pause or seek backward!
                     val existingPos = try {
                         playerFrag.player?.getPosition() ?: 0L
                     } catch (_: Throwable) {
                         0L
                     }
-                    if (existingPos > 1_500L) {
+                    if (existingPos > 3_500L) {
                         lastIntroPlayerIdentity = fragId
+                        lastIntroMediaKey = effectiveMediaKey
                         schedulePostStartSkipSync(isCastingNow = false)
                         return
                     }
 
                     lastIntroPlayerIdentity = fragId
+                    lastIntroMediaKey = effectiveMediaKey
                     isIntroOverlayActive = true
 
                     val decor = act.window?.decorView as? ViewGroup
@@ -1194,6 +1216,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             searchPaginationMap.clear()
             castStreamUrlCache.clear()
             transcodedStreamUrls.clear()
+            transcodedStreamContextMap.clear()
             mkvCuesTailCache.clear()
             mkvCuesTailWarmInProgress.clear()
             torrUrlToCastQueryMap.clear()
@@ -1247,6 +1270,93 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 method.invoke(CommonActivity, act) != null
             } catch (_: Throwable) {
                 false
+            }
+        }
+
+        /**
+         * Continuously syncs Chromecast playback position & duration into CloudStream's
+         * `DataStoreHelper.setViewPosAndResume` every 3 seconds whenever a Cast session is active!
+         *
+         * Fixes a built-in CloudStream bug in `SelectSourceController.onMediaStatusUpdated` where:
+         * 1. Movies (`episodes.size == 1`) and the final episode of a season (`episodes.size <= currentEpisodeIndex + 1`)
+         *    NEVER have their watch position saved at all!
+         * 2. Multi-episode series erroneously save progress under `episodes[currentEpisodeIndex + 1]`
+         *    instead of `episodes[currentEpisodeIndex]`.
+         */
+        fun ensureCastProgressMonitorRunning() {
+            if (isCastProgressThreadRunning) return
+            synchronized(proxyLock) {
+                if (isCastProgressThreadRunning) return
+                isCastProgressThreadRunning = true
+            }
+            val mainHandler = Handler(Looper.getMainLooper())
+            thread(isDaemon = true, name = "North-CastProgressSaver") {
+                try {
+                    while (true) {
+                        try {
+                            mainHandler.post {
+                                try {
+                                    val act = CommonActivity.activity ?: return@post
+                                    val getCastMethod = CommonActivity::class.java.getMethod(
+                                        "getCastSession",
+                                        android.app.Activity::class.java
+                                    )
+                                    val castSession = getCastMethod.invoke(CommonActivity, act) ?: return@post
+                                    val getRmcMethod = castSession.javaClass.getMethod("getRemoteMediaClient")
+                                    val rmc = getRmcMethod.invoke(castSession) ?: return@post
+
+                                    val posMs = (rmc.javaClass.getMethod("getApproximateStreamPosition").invoke(rmc) as? Long) ?: 0L
+                                    var durMs = (rmc.javaClass.getMethod("getStreamDuration").invoke(rmc) as? Long) ?: 0L
+
+                                    val mediaInfo = rmc.javaClass.getMethod("getMediaInfo").invoke(rmc) ?: return@post
+                                    if (durMs <= 0L) {
+                                        durMs = (mediaInfo.javaClass.getMethod("getStreamDuration").invoke(mediaInfo) as? Long) ?: 0L
+                                    }
+                                    val customData = mediaInfo.javaClass.getMethod("getCustomData").invoke(mediaInfo) as? JSONObject
+                                        ?: return@post
+                                    val rawJson = customData.toString()
+                                    if (rawJson.isBlank()) return@post
+
+                                    val meta = AppUtils.tryParseJson<com.lagradost.cloudstream3.ui.MetadataHolder>(rawJson)
+                                        ?: return@post
+                                    val eps = meta.episodes
+                                    if (eps.isEmpty()) return@post
+
+                                    val curIdx = meta.currentEpisodeIndex.coerceIn(0, eps.size - 1)
+                                    val currentEp = eps.getOrNull(curIdx) ?: return@post
+                                    val nextEp = eps.getOrNull(curIdx + 1)
+
+                                    if (durMs <= 0L) {
+                                        val fallbackCtxDur = transcodedStreamContextMap.values.firstOrNull { it.durationMs > 30_000.0 }
+                                            ?.durationMs?.toLong() ?: 0L
+                                        if (fallbackCtxDur > 30_000L) {
+                                            durMs = fallbackCtxDur
+                                        }
+                                    }
+
+                                    if (posMs > 3_000L && durMs > 30_000L) {
+                                        com.lagradost.cloudstream3.utils.DataStoreHelper.setViewPosAndResume(
+                                            currentEp.id,
+                                            posMs,
+                                            durMs,
+                                            currentEp,
+                                            nextEp
+                                        )
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            Thread.sleep(3_000L)
+                        } catch (_: Throwable) {
+                            break
+                        }
+                    }
+                } finally {
+                    isCastProgressThreadRunning = false
+                }
             }
         }
 
@@ -2805,17 +2915,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     requestedEndInclusive = spec.substringAfter("-", "").trim().toLongOrNull() ?: -1L
                 }
 
-                // If a Chromecast receiver probes a non-zero byte range on a live-transcoded stream,
-                // reset the range to start from offset 0 (HTTP 200 OK with Accept-Ranges: none) instead of
-                // returning HTTP 416, because HTTP 416 causes Chromium's MultibufferDataSource on Chromecast
-                // to immediately abort playback with MEDIA_ERR_NETWORK!
-                val forceTranscodedRestartFromZero = isChromecastRequest &&
-                    requestedStartOffset > 0L &&
-                    transcodedStreamUrls.containsKey(torrStreamUrl)
-                if (forceTranscodedRestartFromZero) {
-                    requestedStartOffset = 0L
-                    requestedEndInclusive = -1L
-                }
+                // Allow Chromecast & Google TV to seek freely across the timeline!
+                // Even if the stream is a live-transcoded 5.1 MKV, we pass `clientRangeHeader` (`bytes=startOffset-`)
+                // to TorrServer and prepend the cached Matroska EBML/Segment/Info/Tracks header before resynchronizing
+                // to the nearest Matroska Cluster (`0x1F43B675`) at the target byte offset!
+                val forceTranscodedRestartFromZero = false
 
                 fun openTorrConnection(streamUrl: String, rangeHeaderValue: String?, readTimeoutMs: Int): HttpURLConnection {
                     return (URL(streamUrl).openConnection() as HttpURLConnection).apply {
@@ -3080,39 +3184,58 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                 var preReadBytes: ByteArray? = null
                 var detectedMkvStream = false
-                // Only block before sending HTTP headers when serving a Chromecast request at offset 0
-                // (to inspect whether live surround-to-stereo Matroska audio transcoding is needed).
-                // For local ExoPlayer & external players, send HTTP response headers immediately!
-                if (isChromecastRequest && method != "HEAD" && startByteOffset == 0L && code in 200..299) {
-                    val peek4 = ByteArray(4)
-                    var readCount = 0
-                    while (readCount < 4) {
-                        val r = bufferedUpstream.read(peek4, readCount, 4 - readCount)
-                        if (r <= 0) break
-                        readCount += r
-                    }
-                    val initialBytes = if (readCount == 4) peek4 else peek4.copyOf(readCount)
-                    val isMkv = initialBytes.size == 4 &&
-                        initialBytes[0] == 0x1A.toByte() &&
-                        initialBytes[1] == 0x45.toByte() &&
-                        initialBytes[2] == 0xDF.toByte() &&
-                        initialBytes[3] == 0xA3.toByte()
-                    detectedMkvStream = isMkv
+                // Inspect Chromecast streams at offset 0 (to parse EBML/Tracks and determine whether live
+                // surround-to-stereo Matroska audio transcoding is needed) AND at sought byte offsets > 0
+                // when a cached TranscodedCastStreamContext exists for this stream!
+                if (isChromecastRequest && method != "HEAD" && code in 200..299) {
+                    if (startByteOffset == 0L) {
+                        val peek4 = ByteArray(4)
+                        var readCount = 0
+                        while (readCount < 4) {
+                            val r = bufferedUpstream.read(peek4, readCount, 4 - readCount)
+                            if (r <= 0) break
+                            readCount += r
+                        }
+                        val initialBytes = if (readCount == 4) peek4 else peek4.copyOf(readCount)
+                        val isMkv = initialBytes.size == 4 &&
+                            initialBytes[0] == 0x1A.toByte() &&
+                            initialBytes[1] == 0x45.toByte() &&
+                            initialBytes[2] == 0xDF.toByte() &&
+                            initialBytes[3] == 0xA3.toByte()
+                        detectedMkvStream = isMkv
 
-                    if (isMkv) {
-                        val handledByTranscoder = streamMatroskaWithChromecastAudio(
-                            initialPrefix = initialBytes,
+                        if (isMkv) {
+                            val handledByTranscoder = streamMatroskaWithChromecastAudio(
+                                initialPrefix = initialBytes,
+                                upstream = bufferedUpstream,
+                                out = out,
+                                streamKey = torrStreamUrl,
+                                streamTitle = cleanTitle,
+                                totalFileBytes = totalFileBytes,
+                                requestedStartOffset = 0L,
+                                requestedEndInclusive = endByteInclusive
+                            )
+                            if (handledByTranscoder.first) {
+                                return
+                            }
+                            preReadBytes = handledByTranscoder.second ?: initialBytes
+                        } else {
+                            preReadBytes = initialBytes
+                        }
+                    } else if (transcodedStreamContextMap.containsKey(torrStreamUrl)) {
+                        detectedMkvStream = true
+                        val handledSeek = streamMatroskaWithChromecastAudioFromSeekOffset(
                             upstream = bufferedUpstream,
                             out = out,
                             streamKey = torrStreamUrl,
-                            streamTitle = cleanTitle
+                            streamTitle = cleanTitle,
+                            totalFileBytes = totalFileBytes,
+                            requestedStartOffset = startByteOffset,
+                            requestedEndInclusive = endByteInclusive
                         )
-                        if (handledByTranscoder.first) {
+                        if (handledSeek) {
                             return
                         }
-                        preReadBytes = handledByTranscoder.second ?: initialBytes
-                    } else {
-                        preReadBytes = initialBytes
                     }
                 }
 
@@ -3121,11 +3244,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     displayName.endsWith(".mkv", ignoreCase = true)
                 val outContentType = if (!isChromecastRequest && isMkvContent) "video/x-matroska" else "video/mp4"
                 val outExt = if (!isChromecastRequest && isMkvContent) "mkv" else "mp4"
-                val outAcceptRanges = if (isChromecastRequest && transcodedStreamUrls.containsKey(torrStreamUrl)) {
-                    "none"
-                } else {
-                    acceptRanges.takeIf { it.equals("bytes", ignoreCase = true) } ?: "bytes"
-                }
+                val outAcceptRanges = acceptRanges.takeIf { it.equals("bytes", ignoreCase = true) } ?: "bytes"
 
                 val responseHeaders = buildString {
                     append("HTTP/1.1 $code $statusText\r\n")
@@ -3606,6 +3725,27 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 pos += len
             }
             return 1_000_000L
+        }
+
+        private fun parseDurationMsFromInfo(infoBody: ByteArray?, timecodeScaleNs: Long): Double {
+            if (infoBody == null || infoBody.isEmpty()) return 0.0
+            var pos = 0
+            while (pos < infoBody.size) {
+                val idPair = readEbmlIdFromArray(infoBody, pos, infoBody.size) ?: break
+                pos += idPair.second
+                val szPair = readEbmlSizeFromArray(infoBody, pos, infoBody.size) ?: break
+                pos += szPair.second
+                val len = szPair.first.toInt()
+                if (len < 0 || pos + len > infoBody.size) break
+                if (idPair.first == 0x4489L && (len == 4 || len == 8)) {
+                    val rawDur = readEbmlFloat(infoBody, pos, len)
+                    if (rawDur > 0.0) {
+                        return (rawDur * timecodeScaleNs.toDouble()) / 1_000_000.0
+                    }
+                }
+                pos += len
+            }
+            return 0.0
         }
 
         private fun parseMkvTracks(tracksBody: ByteArray): List<MkvTrackInfo> {
@@ -4490,6 +4630,168 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         /**
+         * Scans an arbitrary mid-file Matroska stream (after a byte-range seek) until it locates the next
+         * valid Matroska `Cluster` (`0x1F43B675`) header followed by a `Timecode` (`0xE7`) element, returning
+         * `Pair(clusterSize, initialTimecodeBytes)` so live audio transcoding can resume seamlessly from ANY
+         * timeline seek bar position on Chromecast!
+         */
+        private fun syncToNextMatroskaCluster(upstream: InputStream, maxScanBytes: Int = 4_194_304): ByteArray? {
+            val window = ByteArray(65536)
+            var filled = 0
+            var totalScanned = 0
+            while (totalScanned < maxScanBytes) {
+                val r = upstream.read(window, filled, window.size - filled)
+                if (r <= 0) break
+                filled += r
+                totalScanned += r
+
+                var i = 0
+                val searchLimit = filled - 16
+                while (i <= searchLimit) {
+                    // Look for Cluster ID: 0x1F 0x43 0xB6 0x75
+                    if (window[i] == 0x1F.toByte() &&
+                        window[i + 1] == 0x43.toByte() &&
+                        window[i + 2] == 0xB6.toByte() &&
+                        window[i + 3] == 0x75.toByte()
+                    ) {
+                        val szPair = readEbmlSizeFromArray(window, i + 4, filled)
+                        if (szPair != null) {
+                            val afterClusterHdr = i + 4 + szPair.second
+                            if (afterClusterHdr < filled) {
+                                val nextByte = window[afterClusterHdr].toInt() and 0xFF
+                                // First element inside a valid Matroska Cluster is Timecode (0xE7), Position (0xA7),
+                                // PrevSize (0xAB), SimpleBlock (0xA3), or BlockGroup (0xA0)
+                                if (nextByte == 0xE7 || nextByte == 0xA7 || nextByte == 0xAB || nextByte == 0xA3 || nextByte == 0xA0) {
+                                    return window.copyOfRange(i, filled)
+                                }
+                            }
+                        }
+                    }
+                    i++
+                }
+
+                if (filled > 32) {
+                    System.arraycopy(window, filled - 16, window, 0, 16)
+                    filled = 16
+                } else {
+                    filled = 0
+                }
+            }
+            return null
+        }
+
+        /**
+         * Handles a mid-stream HTTP Range seek (`requestedStartOffset > 0`) on a live-transcoded Chromecast
+         * Matroska stream by:
+         * 1. Returning `HTTP/1.1 206 Partial Content` with `Accept-Ranges: bytes` and `Content-Range` so
+         *    Chromecast's ExpandedController seekbar and +/- 30s buttons remain active.
+         * 2. If the seek is an EOF probe (`totalFileBytes - requestedStartOffset <= 262_144`), returning
+         *     clean zero-padded/EOF bytes immediately so Chromium's `MultibufferDataSource` completes its
+         *    file-size verification without stalling.
+         * 3. For any timeline seek position, resynchronizing to the nearest Matroska `Cluster` (`0x1F43B675`)
+         *    and streaming transcoded 2.0 Stereo AAC clusters from that exact timestamp onward!
+         */
+        private fun streamMatroskaWithChromecastAudioFromSeekOffset(
+            upstream: InputStream,
+            out: OutputStream,
+            streamKey: String,
+            streamTitle: String,
+            totalFileBytes: Long,
+            requestedStartOffset: Long,
+            requestedEndInclusive: Long
+        ): Boolean {
+            val ctx = transcodedStreamContextMap[streamKey] ?: return false
+            val safeTotal = if (totalFileBytes > requestedStartOffset) {
+                totalFileBytes
+            } else if (ctx.totalFileBytes > requestedStartOffset) {
+                ctx.totalFileBytes
+            } else {
+                requestedStartOffset + 104_857_600L
+            }
+            val safeEnd = if (requestedEndInclusive in requestedStartOffset until safeTotal) {
+                requestedEndInclusive
+            } else {
+                safeTotal - 1L
+            }
+            val rangeLen = (safeEnd - requestedStartOffset + 1L).coerceAtLeast(1L)
+
+            // Fast-path for Chromium's small end-of-file probe (e.g. last 64 KB) when opening a stream
+            if (safeTotal - requestedStartOffset <= 262_144L || rangeLen <= 65_536L) {
+                val probeHeaders = buildString {
+                    append("HTTP/1.1 206 Partial Content\r\n")
+                    append("Content-Type: video/mp4\r\n")
+                    append("icy-name: $streamTitle\r\n")
+                    append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotal\r\n")
+                    append("Content-Length: $rangeLen\r\n")
+                    append("Access-Control-Allow-Origin: *\r\n")
+                    append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+                    append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                    append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(probeHeaders.toByteArray(Charsets.US_ASCII))
+                val buf = ByteArray(16384)
+                var remaining = rangeLen
+                while (remaining > 0L) {
+                    val toRead = min(remaining, buf.size.toLong()).toInt()
+                    val n = upstream.read(buf, 0, toRead)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    remaining -= n
+                }
+                out.flush()
+                return true
+            }
+
+            val syncedPrefix = syncToNextMatroskaCluster(upstream) ?: return false
+            val reader = EbmlRecordingReader(syncedPrefix, upstream).apply {
+                recordPassthrough = false
+            }
+
+            // Read the first synced Cluster ID + Size
+            val firstId = reader.readElementId() ?: return false
+            if (firstId.first != 0x1F43B675L) return false
+            val firstSz = reader.readElementSize() ?: return false
+
+            val needsAudioDecode = !isChromecastSafeDirectAudio(ctx.chosenAudio)
+            val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(ctx.chosenAudio) else null
+
+            try {
+                val httpHeaders = buildString {
+                    append("HTTP/1.1 206 Partial Content\r\n")
+                    append("Content-Type: video/mp4\r\n")
+                    append("icy-name: $streamTitle\r\n")
+                    append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotal\r\n")
+                    append("Access-Control-Allow-Origin: *\r\n")
+                    append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+                    append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                    append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(httpHeaders.toByteArray(Charsets.US_ASCII))
+                out.flush()
+
+                streamTranscodedClustersLoop(
+                    reader = reader,
+                    out = out,
+                    videoTracks = ctx.videoTracks,
+                    chosenAudio = ctx.chosenAudio,
+                    timecodeScaleNs = ctx.timecodeScaleNs,
+                    transcoder = transcoder,
+                    firstClusterSize = firstSz.first
+                )
+            } catch (_: Throwable) {
+            } finally {
+                transcoder?.release()
+            }
+            return true
+        }
+
+        /**
          * Inspects a Matroska stream for Chromecast and, if its audio track uses `A_EAC3`, `A_AC3`,
          * `A_DTS`, `A_TRUEHD`, or `>2` channels, remuxes and transcodes the audio on-the-fly to
          * 2.0 Stereo `A_AAC` (or `A_PCM/INT/LIT`).
@@ -4502,7 +4804,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             upstream: InputStream,
             out: OutputStream,
             streamKey: String,
-            streamTitle: String = "North Stream"
+            streamTitle: String = "North Stream",
+            totalFileBytes: Long = -1L,
+            requestedStartOffset: Long = 0L,
+            requestedEndInclusive: Long = -1L
         ): Pair<Boolean, ByteArray?> {
             val reader = EbmlRecordingReader(initialPrefix, upstream)
 
@@ -4584,19 +4889,40 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             val needsAudioDecode = !isChromecastSafeDirectAudio(chosenAudio)
             val transcoder = if (needsAudioDecode) ChromecastAudioTranscoder(chosenAudio) else null
 
+            val parsedDurationMs = parseDurationMsFromInfo(infoBody, timecodeScaleNs)
+            val safeTotalBytes = if (totalFileBytes > 0L) totalFileBytes else 1_610_612_736L
+
             transcodedStreamUrls[streamKey] = true
+            transcodedStreamContextMap[streamKey] = TranscodedCastStreamContext(
+                ebmlHeaderBody = ebmlBody,
+                infoBody = infoBody,
+                timecodeScaleNs = timecodeScaleNs,
+                videoTracks = videoTracks,
+                chosenAudio = chosenAudio,
+                durationMs = parsedDurationMs,
+                totalFileBytes = safeTotalBytes,
+                firstClusterOffset = 65536L
+            )
 
             try {
-                // 4. Send HTTP 200 OK headers for live-transcoded stream (Accept-Ranges: none prevents end-of-file Cues seeking)
+                val safeEnd = if (requestedEndInclusive in requestedStartOffset until safeTotalBytes) {
+                    requestedEndInclusive
+                } else {
+                    safeTotalBytes - 1L
+                }
+                // 4. Send HTTP 206 Partial Content headers with Accept-Ranges: bytes and Content-Range
+                // so Chromecast's Default Media Receiver enables the timeline seekbar and +/- 30s buttons!
                 val httpHeaders = buildString {
-                    append("HTTP/1.1 200 OK\r\n")
+                    append("HTTP/1.1 206 Partial Content\r\n")
                     append("Content-Type: video/mp4\r\n")
                     append("icy-name: $streamTitle\r\n")
                     append("Content-Disposition: inline; filename=\"$streamTitle.mp4\"\r\n")
-                    append("Accept-Ranges: none\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Range: bytes $requestedStartOffset-$safeEnd/$safeTotalBytes\r\n")
                     append("Access-Control-Allow-Origin: *\r\n")
                     append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
                     append("Access-Control-Allow-Headers: Range, If-Range, Content-Type, Origin, Accept\r\n")
+                    append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
                     append("Connection: close\r\n\r\n")
                 }
                 out.write(httpHeaders.toByteArray(Charsets.US_ASCII))
@@ -4628,12 +4954,37 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 writeEbmlElement(out, 0x1654AE6BL, newTracksBuf.toByteArray())
                 out.flush()
 
-                val videoTrackNumbers = videoTracks.map { it.trackNumber }.toHashSet()
-                val audioTrackNumber = chosenAudio.trackNumber
-                val outClusterBuf = ByteArrayOutputStream(262144)
-                var currentClusterTimecode = 0L
-                var clusterHasTimecode = false
-                var hasFlushedFirstCluster = false
+                streamTranscodedClustersLoop(
+                    reader = reader,
+                    out = out,
+                    videoTracks = videoTracks,
+                    chosenAudio = chosenAudio,
+                    timecodeScaleNs = timecodeScaleNs,
+                    transcoder = transcoder,
+                    firstClusterSize = firstClusterSize
+                )
+            } catch (_: Throwable) {
+            } finally {
+                transcoder?.release()
+            }
+            return Pair(true, null)
+        }
+
+        private fun streamTranscodedClustersLoop(
+            reader: EbmlRecordingReader,
+            out: OutputStream,
+            videoTracks: List<MkvTrackInfo>,
+            chosenAudio: MkvTrackInfo,
+            timecodeScaleNs: Long,
+            transcoder: ChromecastAudioTranscoder?,
+            firstClusterSize: Long?
+        ) {
+            val videoTrackNumbers = videoTracks.map { it.trackNumber }.toHashSet()
+            val audioTrackNumber = chosenAudio.trackNumber
+            val outClusterBuf = ByteArrayOutputStream(262144)
+            var currentClusterTimecode = 0L
+            var clusterHasTimecode = false
+            var hasFlushedFirstCluster = false
 
                 fun flushCurrentCluster() {
                     if (clusterHasTimecode && outClusterBuf.size() > 0) {
@@ -4821,7 +5172,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 // Process the first Cluster
                 if (firstClusterSize != null) {
                     if (!processClusterBody(firstClusterSize)) {
-                        return Pair(true, null)
+                        return
                     }
                 }
 
@@ -4835,11 +5186,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         if (nextSz.first < 0L || !reader.skipExact(nextSz.first)) break
                     }
                 }
-            } catch (_: Throwable) {
-            } finally {
-                transcoder?.release()
-            }
-            return Pair(true, null)
         }
 
         /**
@@ -7114,9 +7460,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (targetPayloads.isEmpty()) return false
 
             val castingNow = isCasting || hasActiveCastSession()
+            ensureCastProgressMonitorRunning()
+            val firstPayload = targetPayloads.first()
+            val currentMediaKey = "${firstPayload.imdbId ?: 0}:${firstPayload.seasonNum ?: 0}:${firstPayload.episodeIndex ?: 0}:${firstPayload.url.hashCode()}"
             if (!castingNow) {
                 if (playNorthIntroEnabled) {
-                    triggerNorthIntroPreRoll(isCastingNow = false)
+                    triggerNorthIntroPreRoll(isCastingNow = false, mediaKey = currentMediaKey)
                 } else {
                     schedulePostStartSkipSync(isCastingNow = false)
                 }
@@ -7266,7 +7615,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // rewrites `/cast/stream.mp4` directly to TorrServer's real `.mkv`/`.mp4` file path anyway!
                     val streamExt = "mp4"
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=34"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=35"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
