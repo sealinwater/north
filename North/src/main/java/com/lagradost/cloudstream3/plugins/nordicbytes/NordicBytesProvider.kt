@@ -507,7 +507,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             "https://ais-pre-fs5ruodr554drkqvwa77pe-203047830676.europe-west1.run.app"
 
         const val CDN_INTRO_VIDEO_URL =
-            "https://raw.githubusercontent.com/sealinwater/north/builds/north_intro.mp4"
+            "https://raw.githubusercontent.com/sealinwater/north/builds/north_intro.mp4?v=33"
 
         // Shared bounded caches to prevent HTTP 429 rate-limiting and native/Dalvik OOM
         private val apiResponseCache = ConcurrentHashMap<String, Pair<Long, String>>()
@@ -807,50 +807,90 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     fun dpPx(v: Int): Int = (v * density).toInt()
 
                     val overlay = FrameLayout(act).apply {
-                        setBackgroundColor(Color.parseColor("#040B16"))
+                        background = GradientDrawable(
+                            GradientDrawable.Orientation.TOP_BOTTOM,
+                            intArrayOf(
+                                Color.parseColor("#020814"),
+                                Color.parseColor("#06202E"),
+                                Color.parseColor("#030916")
+                            )
+                        )
                         isClickable = true
                         isFocusable = true
                         elevation = 999f
                         alpha = 0f
                     }
 
-                    // Instant native NORTH Studio title card (zero blank frame & guaranteed fallback)
+                    // Nordic Aurora & Scandinavian Studio Title Card (instant render & fallback behind MP4)
                     val titleStack = LinearLayout(act).apply {
                         orientation = LinearLayout.VERTICAL
                         gravity = Gravity.CENTER
+                        setPadding(dpPx(28), dpPx(22), dpPx(28), dpPx(22))
+                        background = GradientDrawable().apply {
+                            setColor(Color.parseColor("#44041326"))
+                            cornerRadius = dpPx(18).toFloat()
+                            setStroke(dpPx(1), Color.parseColor("#4D34D399"))
+                        }
+                    }
+                    val crownBadge = TextView(act).apply {
+                        text = "✦   N O R D I C B Y T E S   ✦"
+                        textSize = 11f
+                        setTextColor(Color.parseColor("#6EE7B7"))
+                        typeface = Typeface.DEFAULT_BOLD
+                        letterSpacing = 0.28f
+                        gravity = Gravity.CENTER
+                        setPadding(0, 0, 0, dpPx(6))
                     }
                     val titleText = TextView(act).apply {
                         text = "N O R T H"
-                        textSize = 40f
+                        textSize = 44f
                         setTextColor(Color.WHITE)
                         typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
-                        letterSpacing = 0.32f
+                        letterSpacing = 0.34f
                         gravity = Gravity.CENTER
+                        setShadowLayer(22f, 0f, 0f, Color.parseColor("#34D399"))
                     }
                     val accentBar = View(act).apply {
-                        background = GradientDrawable().apply {
-                            setColor(Color.parseColor("#38BDF8"))
+                        background = GradientDrawable(
+                            GradientDrawable.Orientation.LEFT_RIGHT,
+                            intArrayOf(
+                                Color.parseColor("#0EA5E9"),
+                                Color.parseColor("#34D399"),
+                                Color.parseColor("#38BDF8")
+                            )
+                        ).apply {
                             cornerRadius = dpPx(4).toFloat()
                         }
                     }
                     val subText = TextView(act).apply {
-                        text = "NORDIC STREAMING"
-                        textSize = 11.5f
-                        setTextColor(Color.parseColor("#38BDF8"))
+                        text = "🇩🇰  🇸🇪  🇳🇴  🇫🇮  🇮🇸   •   N O R D I C   C I N E M A"
+                        textSize = 12f
+                        setTextColor(Color.parseColor("#BAE6FD"))
                         typeface = Typeface.DEFAULT_BOLD
-                        letterSpacing = 0.25f
+                        letterSpacing = 0.22f
                         gravity = Gravity.CENTER
-                        setPadding(0, dpPx(10), 0, 0)
+                        setPadding(0, dpPx(12), 0, 0)
                     }
+                    val mottoText = TextView(act).apply {
+                        text = "AURORA BOREALIS  •  TRUE NORDIC STREAMING"
+                        textSize = 9.5f
+                        setTextColor(Color.parseColor("#6EE7B7"))
+                        typeface = Typeface.DEFAULT_BOLD
+                        letterSpacing = 0.24f
+                        gravity = Gravity.CENTER
+                        setPadding(0, dpPx(6), 0, 0)
+                    }
+                    titleStack.addView(crownBadge)
                     titleStack.addView(titleText)
                     titleStack.addView(
                         accentBar,
-                        LinearLayout.LayoutParams(dpPx(72), dpPx(3)).apply {
+                        LinearLayout.LayoutParams(dpPx(140), dpPx(3)).apply {
                             gravity = Gravity.CENTER_HORIZONTAL
                             topMargin = dpPx(10)
                         }
                     )
                     titleStack.addView(subText)
+                    titleStack.addView(mottoText)
                     overlay.addView(
                         titleStack,
                         FrameLayout.LayoutParams(
@@ -6112,7 +6152,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             return newHomePageResponse(
                 listOf(
                     HomePageList(
-                        "⚠ Account API Key Required — Tap Card for Sign-Up & Key Guide (nordicbytes.org/application)",
+                        "⚠ Account API Key Required: Tap Card for Sign-Up & Key Guide (nordicbytes.org/application)",
                         listOf(buildOnboardingGuideCard())
                     )
                 ),
@@ -6630,21 +6670,21 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         if (url.contains("/onboarding_guide") || apiToken.isEmpty()) {
             val guidePlot = buildString {
                 append("⚠️ ACCOUNT API KEY REQUIRED\n")
-                append("North requires an active NordicBytes (nordicbytes.org) account and personal UNIT3D API Key to work.\n\n")
+                append("You need a NordicBytes (nordicbytes.org) account and your personal UNIT3D API key to use North.\n\n")
                 append("1️⃣ APPLY TO JOIN AT: https://nordicbytes.org/application\n")
-                append("• Your Application is Fully Public: Everything you write in your application text and your experience level (e.g. \"New — I haven’t used private trackers before\" or experienced) is visible to every member of the community. Members read it to decide whether to vouch for you. Be honest, be specific, and make it count.\n")
-                append("• ⚠️ No Personal Info: Do NOT, under any circumstance, include your real name, home address, or any other personal identifiable information.\n")
-                append("• Where Are You From? (Anonymous): Optional — shown to the community alongside your application.\n")
-                append("• Email Address (Staff Only): Visible only to staff.\n")
-                append("• Proof (Staff Only — Required): Provide at least 2 screenshots (Screenshot URL + Profile URL) showing your tracker membership — username, ratio, and upload/download. Required; no proof = automatic rejection.\n\n")
+                append("• Your Application is Public: Whatever you write in the application box and your experience level (like \"New, I haven't used private trackers before\" or experienced) can be seen by all members on the site so they can vouch for you. Just be honest and write a clear answer.\n")
+                append("• ⚠️ No Personal Info: Never put your real name, home address, or any other private personal info in the application text.\n")
+                append("• Where Are You From? (Anonymous): Optional, shown next to your application.\n")
+                append("• Email Address (Staff Only): Only staff can see this.\n")
+                append("• Proof (Staff Only, Required): Add at least 2 screenshots (Screenshot URL + Profile URL) showing your profile on another tracker with your username, ratio, and upload/download stats. You need proof or the application gets rejected.\n\n")
                 append("2️⃣ GET YOUR API KEY (Already have an account?)\n")
                 append("• Log in at https://nordicbytes.org/login\n")
-                append("• Go to your Profile (top right) → Settings → API Key / Security and copy your UNIT3D API Token.\n\n")
+                append("• Open your Profile (top right) -> Settings -> API Key / Security and copy your UNIT3D API token.\n\n")
                 append("3️⃣ ADD YOUR KEY IN CLOUDSTREAM\n")
-                append("• Open Cloudstream → Settings → Extensions → tap the ⚙️ Gear Icon next to North, paste your API Key, and tap \"Save & Restart CloudStream\" (or search apikey:YOUR_TOKEN in the search bar).")
+                append("• Go to Cloudstream -> Settings -> Extensions -> tap the ⚙️ Gear Icon next to North, paste your API key, and tap \"Save & Restart CloudStream\" (or search apikey:YOUR_TOKEN in the search bar).")
             }
             return newMovieLoadResponse(
-                name = "🔑 Account Key Required — Sign Up & API Key Guide",
+                name = "🔑 Account Key Required: Sign Up & API Key Guide",
                 url = url,
                 type = TvType.Movie,
                 dataUrl = ""
@@ -7150,7 +7190,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
                     val castFlag = if (castingNow) "1" else "0"
                     val isMkvFile = parsedMeta?.files?.getOrNull(exactFileIndex - 1)?.first?.endsWith(".mkv", ignoreCase = true)
-                        ?: !stream.name.contains(".mp4", ignoreCase = true)
+                        ?: !displayTitle.contains(".mp4", ignoreCase = true)
                     val streamExt = if (castingNow || !isMkvFile) "mp4" else "mkv"
                     val unifiedStreamUrl =
                         "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&v=33"

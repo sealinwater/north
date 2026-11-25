@@ -1,6 +1,6 @@
 {
   "name": "North (Account API Key Required)",
-  "description": "North • Deep Blue Nordic & Danish Cloudstream Extension (by sealinwater). ⚠️ ACCOUNT API KEY REQUIRED: Requires a NordicBytes account & UNIT3D API Key to work. Apply at https://nordicbytes.org/application (application text is public for community vouching — never include real name/PII; email & 2 tracker proof screenshot/profile URLs are staff-only), then copy your API key from Profile -> Settings -> API Key into North Settings.",
+  "description": "North • Nordic & Danish Cloudstream Extension (by sealinwater). ⚠️ ACCOUNT API KEY REQUIRED: You need a NordicBytes account and UNIT3D API key to use North. Apply at https://nordicbytes.org/application (your application text is public so members can vouch for you, so don't include your real name or personal info; your email and 2 tracker proof screenshot/profile links are only visible to staff), then copy your API key from Profile -> Settings -> API Key into North Settings.",
   "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
   "manifestVersion": 1,
   "pluginLists": [
