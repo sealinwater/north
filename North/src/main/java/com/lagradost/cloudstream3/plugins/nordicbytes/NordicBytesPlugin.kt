@@ -137,6 +137,7 @@ class NordicBytesPlugin : Plugin() {
             }
             prefs.edit().putInt("exo_cache_purged_version", 33).apply()
         }
+        NordicBytesProvider.clearNorthRepoLinkCache()
         NordicBytesProvider.purgeStaleExoPlayerSimpleCache()
         NordicBytesProvider.registerNorthSkipApi()
         NordicBytesProvider.ensureLocalProxyServer()
@@ -332,7 +333,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V39"
+            text = "NORTH • SEALINWATER • V40"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
