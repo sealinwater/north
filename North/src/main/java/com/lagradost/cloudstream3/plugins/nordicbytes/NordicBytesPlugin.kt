@@ -333,7 +333,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V43"
+            text = "NORTH • SEALINWATER • V44"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD

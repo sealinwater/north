@@ -611,19 +611,34 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             return noPeersTs > 0L && (now - noPeersTs) < 90_000L
         }
 
-        private fun showDeadSwarmToastThrottled(hashLower: String, message: String) {
+        private fun showDeadSwarmToastThrottled(
+            hashLower: String,
+            message: String,
+            postFollowUp: Boolean = true
+        ) {
             val now = System.currentTimeMillis()
             val key = hashLower.ifBlank { "default" }
             val lastTs = lastDeadToastMsByHash[key] ?: 0L
-            if (now - lastTs < 15_000L) return
+            if (now - lastTs < 12_000L) return
             lastDeadToastMsByHash[key] = now
             try {
                 val ctx = CommonActivity.activity ?: (getContext() as? Context) ?: return
-                Handler(Looper.getMainLooper()).post {
+                val mainHandler = Handler(Looper.getMainLooper())
+                mainHandler.post {
                     try {
                         Toast.makeText(ctx, message, Toast.LENGTH_LONG).show()
                     } catch (_: Throwable) {
                     }
+                }
+                if (postFollowUp) {
+                    // Show once more after 2.4s so CloudStream's generic "No Links Found / 2001" toast
+                    // cannot hide the actual tracker/seeder status when a season only has 1 source.
+                    mainHandler.postDelayed({
+                        try {
+                            Toast.makeText(ctx, message, Toast.LENGTH_LONG).show()
+                        } catch (_: Throwable) {
+                        }
+                    }, 2_400L)
                 }
             } catch (_: Throwable) {
             }
@@ -1896,7 +1911,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             ghostRatioEnabled: Boolean
         ): ByteArray {
             if (!ghostRatioEnabled || localPort <= 0 || parsedMeta == null) return originalBytes
-            val primaryTracker = parsedMeta.trackers.firstOrNull { it.startsWith("http") } ?: return originalBytes
+            val httpTrackers = parsedMeta.trackers.filter { it.startsWith("http") }.distinct()
+            val primaryTracker = httpTrackers.firstOrNull() ?: return originalBytes
             val rawInfo = parsedMeta.rawInfoBytes ?: return originalBytes
             if (rawInfo.isEmpty()) return originalBytes
 
@@ -1906,17 +1922,25 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     "http://127.0.0.1:$localPort/announce?upstream=${URLEncoder.encode(primaryTracker, "UTF-8")}&size=$totalSize"
                 val announceBytes = proxyAnnounceUrl.toByteArray(Charsets.UTF_8)
 
-                // Construct valid bencoded dictionary: d8:announce<len>:<url>4:info<rawInfo>e
-                val header = "d8:announce${announceBytes.size}:".toByteArray(Charsets.US_ASCII)
-                val middle = "4:info".toByteArray(Charsets.US_ASCII)
-                val footer = "e".toByteArray(Charsets.US_ASCII)
-
-                val out = ByteArrayOutputStream(header.size + announceBytes.size + middle.size + rawInfo.size + footer.size)
-                out.write(header)
+                // Construct valid bencoded dictionary with sorted keys (`announce`, optional `announce-list`, `info`)
+                val out = ByteArrayOutputStream(announceBytes.size + rawInfo.size + 256)
+                out.write("d8:announce${announceBytes.size}:".toByteArray(Charsets.US_ASCII))
                 out.write(announceBytes)
-                out.write(middle)
+                if (httpTrackers.size > 1) {
+                    out.write("13:announce-listl".toByteArray(Charsets.US_ASCII))
+                    for (tr in httpTrackers) {
+                        val trProxied =
+                            "http://127.0.0.1:$localPort/announce?upstream=${URLEncoder.encode(tr, "UTF-8")}&size=$totalSize"
+                        val trBytes = trProxied.toByteArray(Charsets.UTF_8)
+                        out.write("l${trBytes.size}:".toByteArray(Charsets.US_ASCII))
+                        out.write(trBytes)
+                        out.write("e".toByteArray(Charsets.US_ASCII))
+                    }
+                    out.write("e".toByteArray(Charsets.US_ASCII))
+                }
+                out.write("4:info".toByteArray(Charsets.US_ASCII))
                 out.write(rawInfo)
-                out.write(footer)
+                out.write("e".toByteArray(Charsets.US_ASCII))
                 out.toByteArray()
             } catch (_: Exception) {
                 originalBytes
@@ -7866,11 +7890,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         val attr = item.attributes ?: return true
         if ((attr.igdbId ?: 0) > 0) return false
 
-        val catId = attr.categoryId
-        if (catId != null && catId > 0) {
-            if (catId != 1 && catId != 2) return false
-        }
-
         val cat = (attr.category ?: "").lowercase(Locale.ROOT)
         val typeStr = (attr.type ?: "").lowercase(Locale.ROOT)
         val rawName = (attr.name ?: item.flatName ?: "").lowercase(Locale.ROOT)
@@ -7884,6 +7903,17 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         )
         if (blockedCategoryKeywords.any { cat.contains(it) || typeStr.contains(it) }) {
             return false
+        }
+
+        val catId = attr.categoryId
+        if (catId != null && catId > 0 && catId != 1 && catId != 2) {
+            val allowedVideoCatKeywords = listOf(
+                "tv", "serie", "movie", "film", "anime", "cartoon", "animation",
+                "kids", "børn", "born", "doc", "pack", "boxset"
+            )
+            val isExplicitVideoCat = allowedVideoCatKeywords.any { cat.contains(it) || typeStr.contains(it) } ||
+                (attr.tmdbId ?: 0) > 0 || (attr.imdbId ?: 0) > 0
+            if (!isExplicitVideoCat) return false
         }
 
         val blockedReleasePatterns = Regex(
@@ -8504,37 +8534,50 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
     }
 
     private suspend fun fetchGroupedTorrents(route: MediaGroupRoute): List<TorrentResource> {
-        val filterQuery = when {
-            route.tmdbId != null && route.tmdbId > 0 ->
-                "/torrents/filter?tmdbId=${route.tmdbId}&categories[]=1&categories[]=2&perPage=100&sortField=seeders&sortDirection=desc"
-            route.imdbId != null && route.imdbId > 0 ->
-                "/torrents/filter?imdbId=${route.imdbId}&categories[]=1&categories[]=2&perPage=100&sortField=seeders&sortDirection=desc"
-            route.cleanTitle.isNotBlank() -> {
-                val dotTitle = toSceneDotQuery(route.cleanTitle)
-                val encoded = URLEncoder.encode(dotTitle, "UTF-8")
-                "/torrents/filter?name=$encoded&categories[]=1&categories[]=2&perPage=100&sortField=seeders&sortDirection=desc"
-            }
-            else -> null
+        val queriesToRun = mutableListOf<String>()
+        if (route.tmdbId != null && route.tmdbId > 0) {
+            queriesToRun.add("/torrents/filter?tmdbId=${route.tmdbId}&perPage=100&sortField=seeders&sortDirection=desc")
+        }
+        if (route.imdbId != null && route.imdbId > 0) {
+            queriesToRun.add("/torrents/filter?imdbId=${route.imdbId}&perPage=100&sortField=seeders&sortDirection=desc")
+        }
+        if (queriesToRun.isEmpty() && route.cleanTitle.isNotBlank()) {
+            val dotTitle = toSceneDotQuery(route.cleanTitle)
+            val encoded = URLEncoder.encode(dotTitle, "UTF-8")
+            queriesToRun.add("/torrents/filter?name=$encoded&categories[]=1&categories[]=2&perPage=100&sortField=seeders&sortDirection=desc")
         }
 
-        if (filterQuery != null) {
+        if (queriesToRun.isNotEmpty()) {
             try {
                 val collected = mutableListOf<TorrentResource>()
-                var cursor: String? = null
-                val maxPages = if (route.isTv && (route.tmdbId != null || route.imdbId != null)) 4 else 1
-                for (pageIdx in 0 until maxPages) {
-                    val pageQuery = if (cursor != null) {
-                        "$filterQuery&cursor=${URLEncoder.encode(cursor, "UTF-8")}"
-                    } else {
-                        filterQuery
+                val seenIds = HashSet<String>()
+                for ((qIdx, filterQuery) in queriesToRun.withIndex()) {
+                    var cursor: String? = null
+                    val maxPages = if (qIdx == 0 && route.isTv && (route.tmdbId != null || route.imdbId != null)) 4 else 1
+                    for (pageIdx in 0 until maxPages) {
+                        val pageQuery = if (cursor != null) {
+                            "$filterQuery&cursor=${URLEncoder.encode(cursor, "UTF-8")}"
+                        } else {
+                            filterQuery
+                        }
+                        val responseText = fetchApiJsonCached(buildApiUrl(pageQuery))
+                        if (responseText.isBlank()) break
+                        val parsed = AppUtils.parseJson<Unit3dListResponse>(responseText)
+                        for (t in parsed.data) {
+                            val dedupeKey = t.id?.takeIf { it.isNotBlank() }
+                                ?: t.attributes?.infoHash?.takeIf { it.isNotBlank() }
+                                ?: t.flatInfoHash?.takeIf { it.isNotBlank() }
+                                ?: (t.attributes?.name ?: t.flatName ?: "")
+                            if (dedupeKey.isBlank() || seenIds.add(dedupeKey)) {
+                                collected.add(t)
+                            }
+                        }
+                        cursor = parsed.meta?.nextCursor?.takeIf { it.isNotBlank() }
+                            ?: extractCursorFromNextUrl(parsed.links?.next)
+                        if (cursor.isNullOrBlank() || parsed.data.isEmpty()) break
                     }
-                    val responseText = fetchApiJsonCached(buildApiUrl(pageQuery))
-                    if (responseText.isBlank()) break
-                    val parsed = AppUtils.parseJson<Unit3dListResponse>(responseText)
-                    collected.addAll(parsed.data)
-                    cursor = parsed.meta?.nextCursor?.takeIf { it.isNotBlank() }
-                        ?: extractCursorFromNextUrl(parsed.links?.next)
-                    if (cursor.isNullOrBlank() || parsed.data.isEmpty()) break
+                    // Only run secondary imdbId merge for TV shows (catches season packs missing a tmdbId tag)
+                    if (!route.isTv && collected.isNotEmpty()) break
                 }
 
                 val list = collected.filter { isAllowedMovieOrSeries(it) }
@@ -8999,13 +9042,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         ?: fallbackFileName?.let { extractCleanTitle(it).takeIf { c -> c.isNotBlank() && !c.equals(officialTitle, ignoreCase = true) } }
                         ?: "Episode $epNum"
 
+                    val maxSeedersForEp = payloads.maxOfOrNull { it.seeders } ?: 0
+                    val seederNote = if (maxSeedersForEp > 0) {
+                        "$maxSeedersForEp seeder${if (maxSeedersForEp == 1) "" else "s"}"
+                    } else {
+                        "0 seeders"
+                    }
                     val sourceBadge = when {
                         singleTorrents.isNotEmpty() && packTorrents.isNotEmpty() ->
-                            "${packTorrents.size} Season Pack & ${singleTorrents.size} Single source(s)"
+                            "${packTorrents.size} Season Pack & ${singleTorrents.size} Single • $seederNote"
                         packTorrents.isNotEmpty() ->
-                            "Season $seasonNum Pack • Episode $epNum • ${packTorrents.size} source${if (packTorrents.size > 1) "s" else ""}"
+                            "Season $seasonNum Pack • Episode $epNum • ${packTorrents.size} source${if (packTorrents.size > 1) "s" else ""} • $seederNote"
                         else ->
-                            "${singleTorrents.size} source${if (singleTorrents.size > 1) "s" else ""} available"
+                            "${singleTorrents.size} source${if (singleTorrents.size > 1) "s" else ""} • $seederNote"
                     }
 
                     val epPlot = metaVideo?.overview?.takeIf { it.isNotBlank() }
@@ -9307,8 +9356,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // rewrites `/cast/stream.mp4` directly to TorrServer's real `.mkv`/`.mp4` file path anyway!
                     val streamExt = "mp4"
                     val sessionTs = System.currentTimeMillis()
+                    val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&ts=$sessionTs&v=43"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=44"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -9406,21 +9456,35 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             var activeReq = req
             var castQueryForRetry: String? = null
             var activeHash = ""
+            var totalSourcesCount = 2
             val localPort = ensureLocalProxyServer()
 
             if (urlStr.contains("/cast/stream")) {
                 val rawQuery = req.url.encodedQuery.orEmpty()
                 castQueryForRetry = rawQuery
+                totalSourcesCount = rawQuery.substringAfter("srcs=", "").substringBefore("&").toIntOrNull()?.coerceAtLeast(1) ?: 2
+                val isSingleSource = totalSourcesCount <= 1
+                val deadSwarmTtlMs = if (isSingleSource) 8_000L else 120_000L
                 val queryHashHint = safeUrlDecode(rawQuery.substringAfter("hash=", "").substringBefore("&")).trim().lowercase(Locale.ROOT)
                 val nowPre = System.currentTimeMillis()
                 if (queryHashHint.isNotBlank() && (nowPre - (unplayableArchiveHashes[queryHashHint] ?: 0L)) < 600_000L) {
-                    showDeadSwarmToastThrottled(queryHashHint, "North: Archive-only release (.rar/.iso), trying next source...")
+                    val msg = if (isSingleSource) {
+                        "North: This release only contains archive files (.rar/.iso) and cannot be streamed."
+                    } else {
+                        "North: Archive-only release (.rar/.iso), trying next source..."
+                    }
+                    showDeadSwarmToastThrottled(queryHashHint, msg, postFollowUp = isSingleSource)
                     throw java.io.IOException("Archive-only release $queryHashHint")
                 }
-                if (queryHashHint.isNotBlank() && (nowPre - (deadSwarmHashes[queryHashHint] ?: 0L)) < 120_000L) {
+                if (queryHashHint.isNotBlank() && (nowPre - (deadSwarmHashes[queryHashHint] ?: 0L)) < deadSwarmTtlMs) {
                     val diag = lastTrackerDiagByHash[queryHashHint].orEmpty()
                     val suffix = if (diag.isNotBlank()) " ($diag)" else ""
-                    showDeadSwarmToastThrottled(queryHashHint, "North: No active seeders$suffix, trying next source...")
+                    val msg = if (isSingleSource) {
+                        "North: No active seeders on NordicBytes$suffix"
+                    } else {
+                        "North: No active seeders$suffix, trying next source..."
+                    }
+                    showDeadSwarmToastThrottled(queryHashHint, msg, postFollowUp = isSingleSource)
                     throw java.io.IOException("No reachable seeders for torrent $queryHashHint")
                 }
                 val resolvedTarget = resolveDirectTorrStreamFromCastQuery(
@@ -9440,15 +9504,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val hKey = activeHash.lowercase(Locale.ROOT)
                     val isArchive = hKey.isNotBlank() && (System.currentTimeMillis() - (unplayableArchiveHashes[hKey] ?: 0L)) < 600_000L
                     val msg = if (isArchive) {
-                        "North: Archive-only release (.rar/.iso), trying next source..."
+                        "North: This release only contains archive files (.rar/.iso)."
                     } else {
-                        "North: Could not load torrent metadata, trying next source..."
+                        "North: Could not load torrent metadata from NordicBytes."
                     }
-                    showDeadSwarmToastThrottled(hKey, msg)
+                    showDeadSwarmToastThrottled(hKey, msg, postFollowUp = isSingleSource)
                     throw java.io.IOException(msg)
                 }
             } else if (urlStr.contains("/stream/")) {
                 castQueryForRetry = torrUrlToCastQueryMap[urlStr]
+                totalSourcesCount = castQueryForRetry?.substringAfter("srcs=", "")?.substringBefore("&")?.toIntOrNull()?.coerceAtLeast(1) ?: 2
                 activeHash = urlStr.substringAfter("link=", "").substringBefore("&").trim()
                 if (idleBeforeReqMs > 15_000L && activeHash.isNotBlank() && !castQueryForRetry.isNullOrBlank()) {
                     val base = resolveRunningTorrServerUrl()
@@ -9491,10 +9556,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
+            val isSingleSource = totalSourcesCount <= 1
+            val deadSwarmTtlMs = if (isSingleSource) 8_000L else 120_000L
             val hashLower = activeHash.lowercase(Locale.ROOT)
             val nowForCheck = System.currentTimeMillis()
             val knownDeadSwarm = hashLower.isNotBlank() &&
-                (nowForCheck - (deadSwarmHashes[hashLower] ?: 0L)) < 120_000L
+                (nowForCheck - (deadSwarmHashes[hashLower] ?: 0L)) < deadSwarmTtlMs
             if (knownDeadSwarm) {
                 throw java.io.IOException("No reachable seeders for torrent $hashLower")
             }
@@ -9502,9 +9569,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             val knownNoExternalPeers = hashLower.isNotBlank() &&
                 (nowForCheck - (noExternalPeersHashes[hashLower] ?: 0L)) < 60_000L
 
+            // When a season only has 1 source and the tracker returned external peers, give a slow home seeder
+            // a generous 28s initial read window so an 8-16 MB resume piece never gets prematurely killed.
+            val initialReadSec = when {
+                knownNoExternalPeers -> 10
+                isSingleSource -> 28
+                else -> 18
+            }
             val initialChain = chain
                 .withConnectTimeout(15, TimeUnit.SECONDS)
-                .withReadTimeout(if (knownNoExternalPeers) 10 else 16, TimeUnit.SECONDS)
+                .withReadTimeout(initialReadSec, TimeUnit.SECONDS)
                 .withWriteTimeout(25, TimeUnit.SECONDS)
 
             val retryChain = chain
@@ -9543,23 +9617,29 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val activePeers = (status?.optInt("active_peers", 0) ?: 0) +
                     (status?.optInt("connected_seeders", 0) ?: 0)
                 val dlSpeed = status?.optDouble("download_speed", 0.0) ?: 0.0
+                val preloaded = status?.optLong("preloaded_bytes", 0L) ?: 0L
                 val stillNoExternalPeers = hashLower.isNotBlank() &&
                     (System.currentTimeMillis() - (noExternalPeersHashes[hashLower] ?: 0L)) < 60_000L
-                if (healthy && activePeers > 0 && dlSpeed > 0.0) {
+                if (healthy && (activePeers > 0 || preloaded > 0L) && (dlSpeed > 0.0 || preloaded > 0L)) {
                     // Torrent is healthy and actively downloading a large piece (e.g. resume seek) -> retry smoothly
                     try {
                         retryChain.proceed(activeReq)
                     } catch (_: java.io.IOException) {
                         retryWithFreshReAdd() ?: throw ioe
                     }
-                } else if (stillNoExternalPeers && dlSpeed <= 0.0) {
+                } else if (stillNoExternalPeers && dlSpeed <= 0.0 && preloaded == 0L) {
                     // Tracker returned 0 external seeders (only self-IP, empty, or error) and 0 B/s downloading;
                     // mark dead and fail fast so CloudStream automatically switches to the next seeded source.
                     if (hashLower.isNotBlank()) {
                         deadSwarmHashes[hashLower] = System.currentTimeMillis()
                     }
                     val diag = lastTrackerDiagByHash[hashLower].orEmpty().ifBlank { "0 peers" }
-                    showDeadSwarmToastThrottled(hashLower, "North: 0 active seeders ($diag), trying next source...")
+                    val msg = if (isSingleSource) {
+                        "North: 0 active seeders on NordicBytes ($diag)"
+                    } else {
+                        "North: 0 active seeders ($diag), trying next source..."
+                    }
+                    showDeadSwarmToastThrottled(hashLower, msg, postFollowUp = isSingleSource)
                     throw ioe
                 } else {
                     retryWithFreshReAdd() ?: throw ioe
@@ -9589,14 +9669,20 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val connPeers = (st?.optInt("active_peers", 0) ?: 0) + (st?.optInt("connected_seeders", 0) ?: 0)
                     val dlSpeed = st?.optDouble("download_speed", 0.0) ?: 0.0
                     val usefulBytes = st?.optLong("bytes_read_useful_data", 0L) ?: 0L
-                    if ((connPeers == 0 || dlSpeed <= 0.0) && usefulBytes == 0L) {
+                    val preloaded = st?.optLong("preloaded_bytes", 0L) ?: 0L
+                    if ((connPeers == 0 || dlSpeed <= 0.0) && usefulBytes == 0L && preloaded == 0L) {
                         try {
                             response.close()
                         } catch (_: Throwable) {
                         }
                         deadSwarmHashes[hashLower] = nowPost
                         val diag = lastTrackerDiagByHash[hashLower].orEmpty().ifBlank { "0 peers" }
-                        showDeadSwarmToastThrottled(hashLower, "North: 0 active seeders ($diag), trying next source...")
+                        val msg = if (isSingleSource) {
+                            "North: 0 active seeders on NordicBytes ($diag)"
+                        } else {
+                            "North: 0 active seeders ($diag), trying next source..."
+                        }
+                        showDeadSwarmToastThrottled(hashLower, msg, postFollowUp = isSingleSource)
                         throw java.io.IOException("No active external seeders for torrent $hashLower ($diag)")
                     }
                 }
@@ -9607,6 +9693,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 if (rawBody != null) {
                     val trackedHashLower = hashLower
                     val trackedActiveHash = activeHash
+                    val trackedIsSingleSource = isSingleSource
                     val trackedBody = object : okhttp3.ResponseBody() {
                         private var deliveredAnyByte = false
                         private val wrappedSource: okio.BufferedSource = object : okio.ForwardingSource(rawBody.source()) {
@@ -9634,10 +9721,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                             (st?.optInt("connected_seeders", 0) ?: 0)
                                         val totalPeers = st?.optInt("total_peers", 0) ?: 0
                                         val dlSpeed = st?.optDouble("download_speed", 0.0) ?: 0.0
+                                        val preloaded = st?.optLong("preloaded_bytes", 0L) ?: 0L
+                                        val usefulBytes = st?.optLong("bytes_read_useful_data", 0L) ?: 0L
                                         val nowErr = System.currentTimeMillis()
                                         val trackerHadNoExt = (nowErr - (noExternalPeersHashes[trackedHashLower] ?: 0L)) < 60_000L
                                         val diag = lastTrackerDiagByHash[trackedHashLower].orEmpty().ifBlank { "no tracker reply" }
-                                        if (dlSpeed <= 0.0) {
+                                        if (dlSpeed <= 0.0 && preloaded == 0L && usefulBytes == 0L) {
                                             val prevCount = zeroPeerTimeoutCount[trackedHashLower] ?: 0
                                             zeroPeerTimeoutCount[trackedHashLower] = prevCount + 1
                                             lastSuccessfulStreamResponseMs = 0L
@@ -9650,11 +9739,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                                 // Mark dead so ExoPlayer stops spinning and switches to next source.
                                                 deadSwarmHashes[trackedHashLower] = nowErr
                                                 val toastMsg = if (trackerHadNoExt) {
-                                                    "North: 0 active seeders ($diag), trying next source..."
+                                                    if (trackedIsSingleSource) {
+                                                        "North: 0 active seeders on NordicBytes ($diag)"
+                                                    } else {
+                                                        "North: 0 active seeders ($diag), trying next source..."
+                                                    }
                                                 } else {
                                                     "North: No seeders responding (peers $connPeers/$totalPeers, $diag)"
                                                 }
-                                                showDeadSwarmToastThrottled(trackedHashLower, toastMsg)
+                                                showDeadSwarmToastThrottled(
+                                                    trackedHashLower,
+                                                    toastMsg,
+                                                    postFollowUp = trackedIsSingleSource
+                                                )
                                             }
                                         }
                                     }
