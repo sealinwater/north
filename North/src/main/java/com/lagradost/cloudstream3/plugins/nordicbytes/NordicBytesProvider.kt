@@ -22,6 +22,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.Fragment
@@ -519,20 +520,53 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private val searchPaginationMap = ConcurrentHashMap<String, CategoryPaginationState>()
         private val castStreamUrlCache = ConcurrentHashMap<String, String>()
         private val noExternalPeersHashes = ConcurrentHashMap<String, Long>()
+        private val deadSwarmHashes = ConcurrentHashMap<String, Long>()
+        private val zeroPeerTimeoutCount = ConcurrentHashMap<String, Int>()
+        private val lastDeadToastMsByHash = ConcurrentHashMap<String, Long>()
         private val torrentAddedTimestampMs = ConcurrentHashMap<String, Long>()
         private const val CACHE_TTL_MS = 180_000L // 3 minutes
         private const val MAX_TORRENT_CACHE_ENTRIES = 20
         private const val PROXY_UNHEALTHY_BACKOFF_MS = 900_000L // 15 minutes
         private const val TRACKER_CLIENT_UA = "qBittorrent/4.6.5"
-        private val stableQbitPeerId: String by lazy {
+
+        private fun generateQbitPeerId(): String {
             val alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-            buildString(20) {
+            return buildString(20) {
                 append("-qB4650-")
                 repeat(12) { append(alphabet[Random.nextInt(alphabet.length)]) }
             }
         }
-        private val stableQbitKey: String by lazy {
-            String.format(Locale.ROOT, "%08X", Random.nextInt())
+
+        private fun generateQbitKey(): String {
+            return String.format(Locale.ROOT, "%08X", Random.nextInt())
+        }
+
+        private fun isKnownDeadHash(hash: String): Boolean {
+            val h = hash.trim().lowercase(Locale.ROOT)
+            if (h.isBlank()) return false
+            val now = System.currentTimeMillis()
+            val deadTs = deadSwarmHashes[h] ?: 0L
+            if (deadTs > 0L && (now - deadTs) < 180_000L) return true
+            val noPeersTs = noExternalPeersHashes[h] ?: 0L
+            return noPeersTs > 0L && (now - noPeersTs) < 90_000L
+        }
+
+        private fun showDeadSwarmToastThrottled(hashLower: String, message: String) {
+            val now = System.currentTimeMillis()
+            val key = hashLower.ifBlank { "default" }
+            val lastTs = lastDeadToastMsByHash[key] ?: 0L
+            if (now - lastTs < 25_000L) return
+            lastDeadToastMsByHash[key] = now
+            try {
+                val ctx = CommonActivity.activity ?: (getContext() as? Context) ?: return
+                Handler(Looper.getMainLooper()).post {
+                    try {
+                        Toast.makeText(ctx, message, Toast.LENGTH_SHORT).show()
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (_: Throwable) {
+            }
         }
 
         @Volatile
@@ -575,7 +609,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             @Volatile var cumulativeUploadedBytes: Long = 0L,
             @Volatile var lastAnnounceMs: Long = 0L,
             @Volatile var lastPeersResponse: ByteArray = ByteArray(0),
-            @Volatile var promotedToSeeder: Boolean = false
+            @Volatile var promotedToSeeder: Boolean = false,
+            @Volatile var peerId: String = generateQbitPeerId(),
+            @Volatile var peerKey: String = generateQbitKey(),
+            @Volatile var needsFreshPeerId: Boolean = false
         )
 
         data class CategoryPaginationState(
@@ -1274,6 +1311,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             searchPaginationMap.clear()
             castStreamUrlCache.clear()
             noExternalPeersHashes.clear()
+            deadSwarmHashes.clear()
+            zeroPeerTimeoutCount.clear()
+            lastDeadToastMsByHash.clear()
             torrentAddedTimestampMs.clear()
             transcodedStreamUrls.clear()
             transcodedStreamContextMap.clear()
@@ -2348,9 +2388,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
-            passthroughParams.add("peer_id=$stableQbitPeerId")
-            passthroughParams.add("key=$stableQbitKey")
-
             val infoHashHex = urlEncodedBytesToHex(rawInfoHashValue)
 
             // Short retry interval (10s) on empty/transient tracker error so TorrServer never sleeps for 30 minutes!
@@ -2374,15 +2411,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             val sep = if (upstreamUrl.contains("?")) "&" else "?"
 
             // When TorrServer stops playback, report final boosted upload + downloaded=0 + left=0 + event=stopped
-            // and reset lastAnnounceMs so the next start fetches fresh peers (keeping lastPeersResponse as fallback
-            // if the tracker returns "Minimum announce interval not met" on an immediate reopen).
+            // using this session's exact peer_id/key so UNIT3D cleanly clears our peer row (no stale self-IP ghosts).
             if (eventValue == "stopped") {
                 val finalUpload = session.cumulativeUploadedBytes
                 val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
+                val stopPeerId = session.peerId
+                val stopPeerKey = session.peerKey
                 session.lastAnnounceMs = 0L
                 session.promotedToSeeder = false
+                session.needsFreshPeerId = true
                 val stopQuery = (
                     passthroughParams + listOf(
+                        "peer_id=$stopPeerId",
+                        "key=$stopPeerKey",
                         "uploaded=$finalUpload",
                         "downloaded=0",
                         "corrupt=0",
@@ -2398,6 +2439,43 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
                 return
             }
+
+            // If this session was previously promoted to seeder (left=0) and is now starting fresh peer discovery
+            // (e.g. reopening a saved season pack or resuming later), cleanly stop the old seeder peer_id in the
+            // background and rotate to a fresh qBittorrent/4.6.5 peer_id + key so UNIT3D always treats this
+            // discovery announce as a fresh leecher and returns 100% of active seedboxes!
+            if (eventValue == "started" && session.needsFreshPeerId) {
+                val oldPeerId = session.peerId
+                val oldPeerKey = session.peerKey
+                val oldUpload = session.cumulativeUploadedBytes
+                session.peerId = generateQbitPeerId()
+                session.peerKey = generateQbitKey()
+                session.needsFreshPeerId = false
+                session.promotedToSeeder = false
+                thread(isDaemon = true, name = "North-CleanOldPeerRow") {
+                    try {
+                        val cleanupStopQuery = (
+                            passthroughParams + listOf(
+                                "peer_id=$oldPeerId",
+                                "key=$oldPeerKey",
+                                "uploaded=$oldUpload",
+                                "downloaded=0",
+                                "corrupt=0",
+                                "left=0",
+                                "numwant=0",
+                                "compact=1",
+                                "event=stopped"
+                            )
+                            ).joinToString("&")
+                        executeTrackerGet("$upstreamUrl$sep$cleanupStopQuery", 4000)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+
+            val sessionPeerId = session.peerId
+            val sessionPeerKey = session.peerKey
+            val identParams = passthroughParams + listOf("peer_id=$sessionPeerId", "key=$sessionPeerKey")
 
             val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
 
@@ -2419,7 +2497,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     thread(isDaemon = true, name = "North-SeederHeartbeat") {
                         try {
                             val heartbeatQuery = (
-                                passthroughParams + listOf(
+                                identParams + listOf(
                                     "uploaded=${session.cumulativeUploadedBytes}",
                                     "downloaded=0",
                                     "corrupt=0",
@@ -2449,7 +2527,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 "left=$declaredTorrentSize"
             }
 
-            val announceQueryList = passthroughParams.toMutableList().apply {
+            val announceQueryList = identParams.toMutableList().apply {
                 add("uploaded=0")
                 add("downloaded=0")
                 add("corrupt=0")
@@ -2467,7 +2545,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (!validExternalPeersFound) {
                 // Retry once as a regular announce (without event=started) in case tracker rejected duplicate started
                 // or returned only self-IP/empty peers on started
-                val regularAnnounceList = passthroughParams.toMutableList().apply {
+                val regularAnnounceList = identParams.toMutableList().apply {
                     add("uploaded=0")
                     add("downloaded=0")
                     add("corrupt=0")
@@ -2488,7 +2566,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             val peerBytes = if (validExternalPeersFound && rawTrackerResp != null) {
-                if (infoHashHex.isNotBlank()) noExternalPeersHashes.remove(infoHashHex)
+                if (infoHashHex.isNotBlank()) {
+                    noExternalPeersHashes.remove(infoHashHex)
+                    deadSwarmHashes.remove(infoHashHex)
+                }
                 session.lastPeersResponse = rawTrackerResp
                 session.lastAnnounceMs = now
                 rawTrackerResp
@@ -2515,12 +2596,15 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             // 35s so we never trip tracker `min_interval` rejections if the user quickly reopens or resumes!
             if (validExternalPeersFound && !session.promotedToSeeder) {
                 session.promotedToSeeder = true
+                session.needsFreshPeerId = true
                 thread(isDaemon = true, name = "North-RatioBooster") {
                     try {
                         Thread.sleep(35_000L)
+                        // Skip promotion if peer_id rotated in the meantime (stream was reset/stopped)
+                        if (session.peerId != sessionPeerId) return@thread
                         val boostUpload = session.cumulativeUploadedBytes
                         val promoteQuery = (
-                            passthroughParams + listOf(
+                            identParams + listOf(
                                 "uploaded=$boostUpload",
                                 "downloaded=0",
                                 "corrupt=0",
@@ -2581,10 +2665,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
             for (entry in ghostSessions.entries) {
                 if (entry.key.contains(hash, ignoreCase = true)) {
-                    // Reset timestamps so next announce queries NordicBytes fresh, while keeping lastPeersResponse as
-                    // fallback in case NordicBytes returns "Minimum announce interval not met".
+                    // Reset timestamps & force a fresh peer_id on next start so UNIT3D always returns live seedboxes,
+                    // while keeping lastPeersResponse as fallback if NordicBytes returns "Minimum announce interval not met".
                     entry.value.lastAnnounceMs = 0L
                     entry.value.promotedToSeeder = false
+                    entry.value.needsFreshPeerId = true
                 }
             }
         }
@@ -2766,6 +2851,15 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
             if (items.isEmpty()) return null
+
+            // Reject unplayable archive-only packs (.rar/.r00/.zip with 0 video files) so ExoPlayer never hangs on them
+            val hasAnyVideo = items.any { videoRegex.containsMatchIn(it.second) }
+            if (!hasAnyVideo) {
+                val archiveRegex = Regex("""(?i)\.(rar|r\d{2}|zip|7z|iso)$""")
+                if (items.any { archiveRegex.containsMatchIn(it.second) }) {
+                    return null
+                }
+            }
 
             if (epNum > 0) {
                 val posMatch = matchEpisodeFileIndexStatic(
@@ -3015,6 +3109,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                 }
                             }
                             val resolvedFile = resolveAuthoritativeTorrFile(statsArr, exactIndex, seasonNum, epNum)
+                            if (resolvedFile == null && statsArr != null && statsArr.length() > 0) {
+                                // Torrent contains only unplayable archive files (.rar/.zip/.iso) -> fail fast to next source
+                                return null
+                            }
                             val resolvedId = resolvedFile?.first ?: exactIndex.coerceAtLeast(1)
                             val rawPath = resolvedFile?.second ?: "video.mkv"
                             val leafName = rawPath.substringAfterLast("/").ifBlank { rawPath }
@@ -8916,7 +9014,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
             val sortedPayloads = targetPayloads.sortedWith(
-                compareByDescending<StreamLinkPayload> { it.seeders > 0 }
+                compareBy<StreamLinkPayload> { isKnownDeadHash(it.infoHash) }
+                    .thenByDescending { it.seeders > 0 }
+                    .thenByDescending { it.seeders >= 2 }
                     .thenBy { !it.isSeasonPack }
                     .thenByDescending { it.isFreeleech }
                     .thenByDescending { it.isDoubleUpload }
@@ -9062,7 +9162,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val streamExt = "mp4"
                     val sessionTs = System.currentTimeMillis()
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&ts=$sessionTs&v=41"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&ts=$sessionTs&v=42"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -9224,17 +9324,24 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             val hashLower = activeHash.lowercase(Locale.ROOT)
+            val nowForCheck = System.currentTimeMillis()
+            val knownDeadSwarm = hashLower.isNotBlank() &&
+                (nowForCheck - (deadSwarmHashes[hashLower] ?: 0L)) < 120_000L
+            if (knownDeadSwarm) {
+                throw java.io.IOException("No reachable seeders for torrent $hashLower")
+            }
+
             val knownNoExternalPeers = hashLower.isNotBlank() &&
-                (System.currentTimeMillis() - (noExternalPeersHashes[hashLower] ?: 0L)) < 60_000L
+                (nowForCheck - (noExternalPeersHashes[hashLower] ?: 0L)) < 60_000L
 
             val initialChain = chain
                 .withConnectTimeout(15, TimeUnit.SECONDS)
-                .withReadTimeout(if (knownNoExternalPeers) 15 else 30, TimeUnit.SECONDS)
-                .withWriteTimeout(30, TimeUnit.SECONDS)
+                .withReadTimeout(if (knownNoExternalPeers) 12 else 22, TimeUnit.SECONDS)
+                .withWriteTimeout(25, TimeUnit.SECONDS)
 
             val retryChain = chain
                 .withConnectTimeout(20, TimeUnit.SECONDS)
-                .withReadTimeout(if (knownNoExternalPeers) 18 else 60, TimeUnit.SECONDS)
+                .withReadTimeout(if (knownNoExternalPeers) 15 else 60, TimeUnit.SECONDS)
                 .withWriteTimeout(60, TimeUnit.SECONDS)
 
             fun retryWithFreshReAdd(): okhttp3.Response? {
@@ -9278,7 +9385,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     }
                 } else if (stillNoExternalPeers && activePeers == 0) {
                     // Tracker returned 0 external seeders (only self-IP or empty) and 0 peers connected;
-                    // fail fast so CloudStream automatically switches to the next seeded source instead of spinning.
+                    // mark dead and fail fast so CloudStream automatically switches to the next seeded source.
+                    if (hashLower.isNotBlank()) {
+                        deadSwarmHashes[hashLower] = System.currentTimeMillis()
+                    }
+                    showDeadSwarmToastThrottled(hashLower, "North: 0 active seeders on this release, trying next source...")
                     throw ioe
                 } else {
                     retryWithFreshReAdd() ?: throw ioe
@@ -9296,10 +9407,34 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
+            // Go's http.ServeContent returns 200/206 headers in <2ms BEFORE downloading any torrent bytes!
+            // If NordicBytes already returned 0 external seeders for this fresh torrent and TorrServer still
+            // has 0 connected peers & 0 useful bytes after 8s, fail fast instead of spinning for 2 minutes.
+            if (response.code in 200..299 && !req.method.equals("HEAD", ignoreCase = true) && hashLower.isNotBlank()) {
+                val noExtTs = noExternalPeersHashes[hashLower] ?: 0L
+                val addedTs = torrentAddedTimestampMs[hashLower] ?: 0L
+                val nowPost = System.currentTimeMillis()
+                if (noExtTs > 0L && (nowPost - noExtTs) < 60_000L && addedTs > 0L && (nowPost - addedTs) >= 8_000L) {
+                    val st = queryTorrServerStatus(resolveRunningTorrServerUrl(), activeHash)
+                    val connPeers = (st?.optInt("active_peers", 0) ?: 0) + (st?.optInt("connected_seeders", 0) ?: 0)
+                    val usefulBytes = st?.optLong("bytes_read_useful_data", 0L) ?: 0L
+                    if (connPeers == 0 && usefulBytes == 0L) {
+                        try {
+                            response.close()
+                        } catch (_: Throwable) {
+                        }
+                        deadSwarmHashes[hashLower] = nowPost
+                        showDeadSwarmToastThrottled(hashLower, "North: 0 active seeders on this release, trying next source...")
+                        throw java.io.IOException("No active external seeders for torrent $hashLower")
+                    }
+                }
+            }
+
             if (response.code in 200..299 && !req.method.equals("HEAD", ignoreCase = true)) {
                 val rawBody = response.body
                 if (rawBody != null) {
                     val trackedHashLower = hashLower
+                    val trackedActiveHash = activeHash
                     val trackedBody = object : okhttp3.ResponseBody() {
                         private var deliveredAnyByte = false
                         private val wrappedSource: okio.BufferedSource = object : okio.ForwardingSource(rawBody.source()) {
@@ -9311,15 +9446,37 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                         val okNow = System.currentTimeMillis()
                                         lastKeepAliveTouchMs = okNow
                                         lastSuccessfulStreamResponseMs = okNow
+                                        if (trackedHashLower.isNotBlank()) {
+                                            zeroPeerTimeoutCount.remove(trackedHashLower)
+                                            deadSwarmHashes.remove(trackedHashLower)
+                                        }
                                     }
                                     n
                                 } catch (bodyErr: java.io.IOException) {
-                                    if (!deliveredAnyByte && bodyErr is SocketTimeoutException) {
-                                        // Real 30s stall timeout with zero media bytes delivered: clear idle & warmup
-                                        // markers so the immediate retry forces a clean rem + re-add + fresh announce!
-                                        lastSuccessfulStreamResponseMs = 0L
-                                        if (trackedHashLower.isNotBlank()) {
+                                    if (!deliveredAnyByte && bodyErr is SocketTimeoutException && trackedHashLower.isNotBlank()) {
+                                        // Real stall timeout with zero media bytes delivered after 206 headers:
+                                        // check whether TorrServer actually has live connected peers or is dead at 0 peers.
+                                        val base = resolveRunningTorrServerUrl()
+                                        val st = queryTorrServerStatus(base, trackedActiveHash)
+                                        val connPeers = (st?.optInt("active_peers", 0) ?: 0) +
+                                            (st?.optInt("connected_seeders", 0) ?: 0)
+                                        val dlSpeed = st?.optDouble("download_speed", 0.0) ?: 0.0
+                                        if (connPeers == 0 && dlSpeed <= 0.0) {
+                                            val prevCount = zeroPeerTimeoutCount[trackedHashLower] ?: 0
+                                            zeroPeerTimeoutCount[trackedHashLower] = prevCount + 1
+                                            lastSuccessfulStreamResponseMs = 0L
                                             torrentAddedTimestampMs.remove(trackedHashLower)
+                                            clearCachedStateForHash(trackedActiveHash)
+                                            removeTorrServerHashSync(base, trackedActiveHash)
+                                            if (prevCount >= 1) {
+                                                // Already retried once with fresh rem + add + fresh peer_id and STILL 0 peers!
+                                                // Mark dead so ExoPlayer stops spinning and CloudStream switches to next source.
+                                                deadSwarmHashes[trackedHashLower] = System.currentTimeMillis()
+                                                showDeadSwarmToastThrottled(
+                                                    trackedHashLower,
+                                                    "North: No reachable seeders on this release, trying next source..."
+                                                )
+                                            }
                                         }
                                     }
                                     throw bodyErr
