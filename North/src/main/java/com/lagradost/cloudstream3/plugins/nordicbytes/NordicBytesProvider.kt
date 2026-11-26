@@ -519,6 +519,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private val searchPaginationMap = ConcurrentHashMap<String, CategoryPaginationState>()
         private val castStreamUrlCache = ConcurrentHashMap<String, String>()
         private val noExternalPeersHashes = ConcurrentHashMap<String, Long>()
+        private val torrentAddedTimestampMs = ConcurrentHashMap<String, Long>()
         private const val CACHE_TTL_MS = 180_000L // 3 minutes
         private const val MAX_TORRENT_CACHE_ENTRIES = 20
         private const val PROXY_UNHEALTHY_BACKOFF_MS = 900_000L // 15 minutes
@@ -1272,6 +1273,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             categoryPaginationMap.clear()
             searchPaginationMap.clear()
             castStreamUrlCache.clear()
+            noExternalPeersHashes.clear()
+            torrentAddedTimestampMs.clear()
             transcodedStreamUrls.clear()
             transcodedStreamContextMap.clear()
             mkvCuesTailCache.clear()
@@ -2398,15 +2401,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
 
-            // CRITICAL: Always fetch fresh peers on `event=started`, after >30s without live stream transfer,
-            // or whenever cached peers are >60 seconds old. Returning an old cached peer list when resuming
-            // a saved stream or after a network/VPN change gives TorrServer stale peers and leaves streams spinning.
-            val streamRecentlyActive = lastSuccessfulStreamResponseMs > 0L &&
-                (now - lastSuccessfulStreamResponseMs) < 30_000L
+            // Always fetch fresh peers on `event=started` or whenever cached peers are >45 seconds old.
+            // Within 45s of a fresh announce, serve cached peers to non-`started` announces so we never
+            // trip NordicBytes' minimum announce interval while warming up a new stream.
             val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
                 eventValue != "started" &&
-                streamRecentlyActive &&
-                (now - session.lastAnnounceMs) < 60_000L
+                (now - session.lastAnnounceMs) < 45_000L
 
             if (cacheIsFresh) {
                 sendHttpResponse(sock, 200, "text/plain", session.lastPeersResponse)
@@ -2438,7 +2438,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 return
             }
 
-            if (eventValue == "started" || !streamRecentlyActive || (now - session.lastAnnounceMs) >= 60_000L) {
+            if (eventValue == "started" || (now - session.lastAnnounceMs) >= 45_000L) {
                 session.promotedToSeeder = false
             }
 
@@ -2621,7 +2621,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         private fun removeTorrServerHashSync(baseUrl: String, hash: String) {
-            if (hash.isBlank() || !isTorrServerAlive(baseUrl)) return
+            if (hash.isBlank()) return
+            torrentAddedTimestampMs.remove(hash.trim().lowercase(Locale.ROOT))
+            if (!isTorrServerAlive(baseUrl)) return
             try {
                 val conn = (URL("$baseUrl/torrents").openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
@@ -2678,11 +2680,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         }
 
         /**
-         * Verifies that a TorrServer torrent actually has live swarm activity and is not a dead zombie
+         * Verifies that a TorrServer torrent actually has live swarm activity (or is still within its
+         * initial 25-second warmup window right after `action: "add"`) and is NOT a dead zombie
          * (`stat == 3` with 0 connected peers and 0 download speed left behind after app idle, sleep,
          * or a Wi-Fi/VPN network switch where TorrServer's tracker timer can sit silent for 30 minutes).
          */
-        private fun isTorrServerSwarmLive(status: JSONObject?, idleBeforeCallMs: Long): Boolean {
+        private fun isTorrServerSwarmLive(
+            status: JSONObject?,
+            hash: String,
+            idleBeforeCallMs: Long
+        ): Boolean {
             if (status == null) return false
             val statCode = status.optInt("stat", 0)
             val activePeers = status.optInt("active_peers", 0)
@@ -2693,10 +2700,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             if (activePeers > 0 || connectedSeeders > 0 || dlSpeed > 0.0) return true
 
-            // After >=10s without successful stream transfer (reopening a saved stream, app resume,
-            // or a Wi-Fi/VPN switch), never trust a 0-peer torrent; remove and re-add it cleanly
-            // to open fresh sockets and force an immediate `event=started` tracker announce.
-            if (idleBeforeCallMs >= 10_000L) return false
+            // Protect freshly added torrents (e.g. prewarmed in loadLinks() right before ExoPlayer's
+            // first Range requests) so we never kill a torrent while its initial tracker announce and
+            // first peer handshakes are still completing.
+            val hashLower = hash.trim().lowercase(Locale.ROOT)
+            val addedAt = if (hashLower.isNotBlank()) (torrentAddedTimestampMs[hashLower] ?: 0L) else 0L
+            if (addedAt > 0L && (System.currentTimeMillis() - addedAt) < 25_000L) {
+                return true
+            }
+
+            // Past the 25s warmup window (or loaded from an earlier app session with no addedAt record):
+            // if we have been idle >=15s with zero connected peers and zero download speed, force a clean
+            // rem + re-add to open fresh sockets and trigger an immediate `event=started` tracker announce.
+            if (idleBeforeCallMs >= 15_000L) return false
 
             return pendingPeers > 0 || statCode == 2 || preloaded > 0L
         }
@@ -2864,7 +2880,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             // (never reuse a dead 0-peer zombie left behind by sleep or a network/VPN change).
                             val status = queryTorrServerStatus(currentBase, cachedHash)
                             if (isTorrServerStatusHealthyForPort(status, effectivePort, requireFiles = true) &&
-                                isTorrServerSwarmLive(status, idleBeforeCallMs)
+                                isTorrServerSwarmLive(status, cachedHash, idleBeforeCallMs)
                             ) {
                                 return cached
                             }
@@ -2901,7 +2917,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
 
                 // 2. Tune TorrServer settings BEFORE adding the torrent, purge any stale/closed/dead-port
-                //    or 0-peer zombie torrent with `action: "rem"`, then POST /torrents `action: "add"`.
+                //    or old 0-peer zombie torrent with `action: "rem"`, then POST /torrents `action: "add"`.
                 try {
                     if (isTorrServerAlive(baseUrl)) {
                         tuneTorrServerForFastStreaming(baseUrl)
@@ -2911,7 +2927,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             val isDeadOrStaleExisting = existingStatus != null && (
                                 forceReAdd ||
                                     !isTorrServerStatusHealthyForPort(existingStatus, effectivePort, requireFiles = true) ||
-                                    !isTorrServerSwarmLive(existingStatus, idleBeforeCallMs)
+                                    !isTorrServerSwarmLive(existingStatus, knownHash, idleBeforeCallMs)
                                 )
                             if (isDeadOrStaleExisting) {
                                 clearCachedStateForHash(knownHash)
@@ -2952,19 +2968,23 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         var statusJson = postAddTorrent()
                         var hash = statusJson?.optString("hash", "")?.trim().orEmpty()
                         if (hash.isNotBlank() && statusJson != null) {
-                            // If TorrServer returned a pre-existing closed/stale-port/zombie torrent (e.g. when
-                            // knownHash was blank), remove it via `action: "rem"` and re-add once cleanly so
-                            // TorrServer opens fresh sockets and sends an immediate `event=started` announce!
+                            // If TorrServer returned a pre-existing closed/stale-port torrent (or an old >30s
+                            // 0-peer zombie from an earlier session when knownHash was blank), remove it via
+                            // `action: "rem"` and re-add once cleanly. NEVER kill a brand-new add!
                             val existingCheck = queryTorrServerStatus(baseUrl, hash) ?: statusJson
                             val portHealthy = isTorrServerStatusHealthyForPort(existingCheck, effectivePort, requireFiles = false)
                             val existingStat = existingCheck.optInt("stat", 0)
                             val existingActive = existingCheck.optInt("active_peers", 0) +
                                 existingCheck.optInt("connected_seeders", 0) +
                                 existingCheck.optInt("pending_peers", 0)
-                            val isZombieWorking = existingStat == 3 &&
+                            val serverTsSec = existingCheck.optLong("timestamp", 0L)
+                            val nowSec = System.currentTimeMillis() / 1000L
+                            val isOldPreexistingZombie = serverTsSec > 0L &&
+                                (nowSec - serverTsSec) > 30L &&
+                                existingStat == 3 &&
                                 existingActive == 0 &&
                                 existingCheck.optDouble("download_speed", 0.0) <= 0.0
-                            if (forceReAdd || !portHealthy || isZombieWorking) {
+                            if (forceReAdd || !portHealthy || isOldPreexistingZombie) {
                                 clearCachedStateForHash(hash)
                                 removeTorrServerHashSync(baseUrl, hash)
                                 try {
@@ -2973,6 +2993,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                 }
                                 statusJson = postAddTorrent()
                                 hash = statusJson?.optString("hash", "")?.trim().orEmpty()
+                            }
+                            if (hash.isNotBlank()) {
+                                torrentAddedTimestampMs[hash.lowercase(Locale.ROOT)] = System.currentTimeMillis()
                             }
                         }
 
@@ -9039,7 +9062,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val streamExt = "mp4"
                     val sessionTs = System.currentTimeMillis()
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&ts=$sessionTs&v=40"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&ts=$sessionTs&v=41"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -9159,11 +9182,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             } else if (urlStr.contains("/stream/")) {
                 castQueryForRetry = torrUrlToCastQueryMap[urlStr]
                 activeHash = urlStr.substringAfter("link=", "").substringBefore("&").trim()
-                if (idleBeforeReqMs > 10_000L && activeHash.isNotBlank() && !castQueryForRetry.isNullOrBlank()) {
+                if (idleBeforeReqMs > 15_000L && activeHash.isNotBlank() && !castQueryForRetry.isNullOrBlank()) {
                     val base = resolveRunningTorrServerUrl()
                     val status = queryTorrServerStatus(base, activeHash)
                     if (!isTorrServerStatusHealthyForPort(status, localPort, requireFiles = true) ||
-                        !isTorrServerSwarmLive(status, idleBeforeReqMs)
+                        !isTorrServerSwarmLive(status, activeHash, idleBeforeReqMs)
                     ) {
                         clearCachedStateForHash(activeHash)
                         removeTorrServerHashSync(base, activeHash)
@@ -9206,8 +9229,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val initialChain = chain
                 .withConnectTimeout(15, TimeUnit.SECONDS)
-                .withReadTimeout(if (knownNoExternalPeers) 15 else 22, TimeUnit.SECONDS)
-                .withWriteTimeout(25, TimeUnit.SECONDS)
+                .withReadTimeout(if (knownNoExternalPeers) 15 else 30, TimeUnit.SECONDS)
+                .withWriteTimeout(30, TimeUnit.SECONDS)
 
             val retryChain = chain
                 .withConnectTimeout(20, TimeUnit.SECONDS)
@@ -9276,6 +9299,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             if (response.code in 200..299 && !req.method.equals("HEAD", ignoreCase = true)) {
                 val rawBody = response.body
                 if (rawBody != null) {
+                    val trackedHashLower = hashLower
                     val trackedBody = object : okhttp3.ResponseBody() {
                         private var deliveredAnyByte = false
                         private val wrappedSource: okio.BufferedSource = object : okio.ForwardingSource(rawBody.source()) {
@@ -9290,12 +9314,13 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                     }
                                     n
                                 } catch (bodyErr: java.io.IOException) {
-                                    if (!deliveredAnyByte) {
-                                        // Body timed out / stalled with zero bytes delivered (e.g. Go http.ServeContent
-                                        // sent 206 headers immediately, then blocked on a dead 0-peer torrent).
-                                        // Reset lastSuccessfulStreamResponseMs so the immediate retry forces a clean
-                                        // TorrServer rem + re-add + fresh tracker announce!
+                                    if (!deliveredAnyByte && bodyErr is SocketTimeoutException) {
+                                        // Real 30s stall timeout with zero media bytes delivered: clear idle & warmup
+                                        // markers so the immediate retry forces a clean rem + re-add + fresh announce!
                                         lastSuccessfulStreamResponseMs = 0L
+                                        if (trackedHashLower.isNotBlank()) {
+                                            torrentAddedTimestampMs.remove(trackedHashLower)
+                                        }
                                     }
                                     throw bodyErr
                                 }
@@ -9305,6 +9330,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         override fun contentType(): okhttp3.MediaType? = rawBody.contentType()
                         override fun contentLength(): Long = rawBody.contentLength()
                         override fun source(): okio.BufferedSource = wrappedSource
+                        override fun close() {
+                            try {
+                                super.close()
+                            } finally {
+                                try {
+                                    rawBody.close()
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
                     }
                     response = response.newBuilder().body(trackedBody).build()
                 }
