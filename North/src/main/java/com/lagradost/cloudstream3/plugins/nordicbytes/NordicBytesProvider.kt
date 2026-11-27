@@ -2757,7 +2757,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             val sessionHashKey = infoHashHex.ifBlank { rawInfoHashParam }.lowercase(Locale.ROOT)
             val detPort = deriveDeterministicQbitPort(infoHashHex)
             val sep = if (upstreamUrl.contains("?")) "&" else "?"
-            val hashLock = announceLocks.computeIfAbsent(sessionHashKey) { Any() }
+            val candidateLock = Any()
+            val hashLock = announceLocks.putIfAbsent(sessionHashKey, candidateLock) ?: candidateLock
 
             val replyBytes: ByteArray = synchronized(hashLock) {
                 val session = ghostSessions[sessionHashKey] ?: run {
