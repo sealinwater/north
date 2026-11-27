@@ -536,6 +536,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         private const val CACHE_TTL_MS = 180_000L // 3 minutes
         private const val MAX_TORRENT_CACHE_ENTRIES = 20
         private const val PROXY_UNHEALTHY_BACKOFF_MS = 900_000L // 15 minutes
+        private val alreadyActiveRejectionHashes = ConcurrentHashMap<String, Long>()
         private const val TRACKER_CLIENT_UA = "qBittorrent/4.6.5"
 
         private fun generateQbitPeerId(): String {
@@ -548,6 +549,85 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
         private fun generateQbitKey(): String {
             return String.format(Locale.ROOT, "%08X", Random.nextInt())
+        }
+
+        private fun getOrCreateDevicePeerSalt(): String {
+            return try {
+                val prefs = getGhostSessionPrefs() ?: return "north-default-salt"
+                val existing = prefs.getString("device_peer_salt", "").orEmpty()
+                if (existing.length >= 16) return existing
+                val created = buildString(24) {
+                    val hex = "0123456789abcdef"
+                    repeat(24) { append(hex[Random.nextInt(hex.length)]) }
+                }
+                prefs.edit().putString("device_peer_salt", created).commit()
+                created
+            } catch (_: Throwable) {
+                "north-default-salt"
+            }
+        }
+
+        /**
+         * Derives a deterministic, whitelisted qBittorrent/4.6.5 `peer_id` (`-qB4650-...`) and 8-hex `key`
+         * from this device's persistent salt + `infoHashHex`.
+         * Even if the app crashes or is force-closed before sending `event=stopped`, the next launch derives
+         * the EXACT SAME `peer_id` and immediately clears or updates the tracker row in <200ms (0-second reset!).
+         */
+        private fun deriveDeterministicQbitIdentity(hashHex: String): Pair<String, String> {
+            val cleanHash = hashHex.trim().lowercase(Locale.ROOT)
+            if (cleanHash.isBlank()) return Pair(generateQbitPeerId(), generateQbitKey())
+            return try {
+                val salt = getOrCreateDevicePeerSalt()
+                val digest = MessageDigest.getInstance("SHA-256")
+                    .digest("$salt|$cleanHash|north-qbit-v48".toByteArray(Charsets.UTF_8))
+                val alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                val peerId = buildString(20) {
+                    append("-qB4650-")
+                    for (i in 0 until 12) {
+                        val b = digest[i].toInt() and 0xFF
+                        append(alphabet[b % alphabet.length])
+                    }
+                }
+                val peerKey = buildString(8) {
+                    val hex = "0123456789ABCDEF"
+                    for (i in 12 until 16) {
+                        val b = digest[i].toInt() and 0xFF
+                        append(hex[(b ushr 4) and 0x0F])
+                        append(hex[b and 0x0F])
+                    }
+                }
+                Pair(peerId, peerKey)
+            } catch (_: Throwable) {
+                Pair(generateQbitPeerId(), generateQbitKey())
+            }
+        }
+
+        fun getLastTrackerDiagnosticSummary(): String {
+            val entries = lastTrackerDiagByHash.entries.toList()
+            if (entries.isEmpty()) return "No tracker announces recorded yet in this session."
+            return entries.takeLast(3).joinToString("\n") { (h, diag) ->
+                "[${h.take(8)}] $diag"
+            }
+        }
+
+        fun forceResetAllSessionsAndTorrServer() {
+            NorthDebugLogger.log("INFO", "RESET", "User triggered Force Reset of tracker sessions & TorrServer")
+            try {
+                val baseUrl = resolveRunningTorrServerUrl()
+                for (hash in torrentAddedTimestampMs.keys.toList()) {
+                    removeTorrServerHashSync(baseUrl, hash)
+                }
+                val cacheBase = torrentsCacheDirPath.ifBlank {
+                    val ctx = CommonActivity.activity ?: (getContext() as? Context)
+                    ctx?.cacheDir?.let { "${it.absolutePath}/torrents" }.orEmpty()
+                }
+                if (cacheBase.isNotBlank()) {
+                    wipeCorruptTorrServerDb(cacheBase)
+                }
+            } catch (_: Throwable) {
+            }
+            alreadyActiveRejectionHashes.clear()
+            clearCaches()
         }
 
         private fun detectPublicIpv4Sync(timeoutMs: Int = 1800): String {
@@ -2635,8 +2715,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val baseUpload = declaredTorrentSize.coerceIn(1_073_741_824L, 4_294_967_296L) +
                     Random.nextLong(15_000_000L, 120_000_000L)
                 val persisted = loadPersistedGhostPeerSession(infoHashHex)
-                val savedPeerId = persisted?.optString("peerId", "").orEmpty()
-                val savedPeerKey = persisted?.optString("peerKey", "").orEmpty()
+                val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
+                val savedPeerId = persisted?.optString("peerId", "").orEmpty().ifBlank { detPeerId }
+                val savedPeerKey = persisted?.optString("peerKey", "").orEmpty().ifBlank { detPeerKey }
                 val savedActive = persisted?.optBoolean("active", false) == true
                 val savedUpload = persisted?.optLong("uploaded", baseUpload)?.coerceAtLeast(baseUpload) ?: baseUpload
                 val savedCompact = loadPersistedCompactPeersForHash(infoHashHex)
@@ -2644,31 +2725,31 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     startTimeMs = now,
                     cumulativeUploadedBytes = savedUpload,
                     lastPeersResponse = if (savedCompact != null) buildShortIntervalCompactPeersBencode(savedCompact, intervalSec = 25) else ByteArray(0),
-                    peerId = savedPeerId.ifBlank { generateQbitPeerId() },
-                    peerKey = savedPeerKey.ifBlank { generateQbitKey() },
-                    // If a previous session crashed while active on disk without sending event=stopped,
-                    // cleanly stop that exact persisted peer_id FIRST before announcing started!
-                    needsFreshPeerId = savedActive && savedPeerId.isNotBlank()
+                    peerId = savedPeerId,
+                    peerKey = savedPeerKey,
+                    // Always stop any prior active/crashed deterministic peer_id first so UNIT3D resets it in <200ms!
+                    needsFreshPeerId = savedActive || persisted != null
                 )
             }
 
             val sep = if (upstreamUrl.contains("?")) "&" else "?"
 
             // When TorrServer stops playback, report final boosted upload + downloaded=0 + left=0 + event=stopped
-            // ONCE synchronously (1.2s cap) and immediately rotate peer_id + clear needsFreshPeerId so a subsequent
-            // re-add NEVER fires a duplicate event=stopped burst that can trip UNIT3D tracker anti-flood!
+            // ONCE synchronously (1.2s cap) using our deterministic peer_id so UNIT3D clears the row cleanly
+            // without ever leaving an orphaned peer_id behind!
             if (eventValue == "stopped") {
                 val finalUpload = session.cumulativeUploadedBytes
                 val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
                 val stopPeerId = session.peerId
                 val stopPeerKey = session.peerKey
-                session.peerId = generateQbitPeerId()
-                session.peerKey = generateQbitKey()
+                val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
+                session.peerId = detPeerId
+                session.peerKey = detPeerKey
                 session.lastAnnounceMs = 0L
                 session.promotedToSeeder = false
                 session.needsFreshPeerId = false
                 session.lastStoppedAtMs = now
-                persistGhostPeerSession(infoHashHex, session.peerId, session.peerKey, finalUpload, active = false)
+                persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, finalUpload, active = false)
                 val stopQuery = (
                     passthroughParams + listOf(
                         "peer_id=$stopPeerId",
@@ -2692,17 +2773,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             // If this session was previously active (e.g. promoted to seeder OR left orphaned by a crash on disk),
-            // cleanly stop the old peer_id FIRST and rotate to a fresh qBittorrent/4.6.5 peer_id + key.
+            // cleanly stop that exact deterministic peer_id FIRST so UNIT3D resets the peer row immediately (<200ms)
+            // instead of rejecting the next announce as a duplicate client!
             if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.needsFreshPeerId) {
                 val oldPeerId = session.peerId
                 val oldPeerKey = session.peerKey
                 val oldUpload = session.cumulativeUploadedBytes
-                session.peerId = generateQbitPeerId()
-                session.peerKey = generateQbitKey()
+                val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
+                session.peerId = detPeerId
+                session.peerKey = detPeerKey
                 session.needsFreshPeerId = false
                 session.promotedToSeeder = false
                 session.lastStoppedAtMs = System.currentTimeMillis()
-                persistGhostPeerSession(infoHashHex, session.peerId, session.peerKey, oldUpload, active = false)
+                persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, oldUpload, active = false)
                 try {
                     val cleanupStopQuery = (
                         passthroughParams + listOf(
@@ -2938,15 +3021,21 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 session.lastPeersResponse = rebuilt
                 rebuilt
             } else {
-                if (infoHashHex.isNotBlank() && !isAlreadyActiveRejection) {
+                if (infoHashHex.isNotBlank()) {
                     noExternalPeersHashes[infoHashHex] = now
-                }
-                if (isAlreadyActiveRejection) {
-                    NorthDebugLogger.reportHandledFatalAsync(
-                        "TRACKER_ALREADY_ACTIVE",
-                        "NordicBytes rejected announce for ${infoHashHex.take(10)}: ${inspection.failureReason}",
-                        null
-                    )
+                    if (isAlreadyActiveRejection) {
+                        alreadyActiveRejectionHashes[infoHashHex] = now
+                        showDeadSwarmToastThrottled(
+                            infoHashHex,
+                            "North: NordicBytes tracker locked (${inspection.failureReason.take(90)}). Wait for auto-expiry or see North Settings.",
+                            postFollowUp = true
+                        )
+                        NorthDebugLogger.reportHandledFatalAsync(
+                            "TRACKER_ALREADY_ACTIVE",
+                            "NordicBytes rejected announce for ${infoHashHex.take(10)}: ${inspection.failureReason}",
+                            null
+                        )
+                    }
                 }
                 // If tracker only returned self-IP peers (e.g. stale local sessions), pass them with a short 20s
                 // interval so TorrServer never sleeps for 30 minutes while our fast-fail switches sources cleanly.
@@ -9621,7 +9710,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val sessionTs = System.currentTimeMillis()
                     val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=47"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=48"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true

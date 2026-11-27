@@ -1,6 +1,8 @@
 package com.lagradost.cloudstream3.plugins.nordicbytes
 
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -335,7 +337,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V47"
+            text = "NORTH • SEALINWATER • V48"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
@@ -800,6 +802,107 @@ class NordicBytesPlugin : Plugin() {
         seedCard.addView(webhookInput, newFieldParams())
 
         root.addView(seedCard)
+
+        // 4B. DIAGNOSTICS, DEBUG LOG & INSTANT SESSION RESET CARD
+        val diagLabel = TextView(context).apply {
+            text = "DIAGNOSTICS & INSTANT SESSION RESET"
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#93C5FD"))
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.08f
+            setPadding(0, dp(context, 10), 0, dp(context, 4))
+        }
+        root.addView(diagLabel)
+
+        val diagCard = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(context, 14), dp(context, 12), dp(context, 14), dp(context, 12))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#0B1B36"))
+                cornerRadius = dp(context, 12).toFloat()
+                setStroke(dp(context, 1), Color.parseColor("#1E3A8A"))
+            }
+        }
+
+        val diagStatusText = TextView(context).apply {
+            text = "Last Tracker Status:\n${NordicBytesProvider.getLastTrackerDiagnosticSummary()}"
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#DBEAFE"))
+            setLineSpacing(dp(context, 2).toFloat(), 1.0f)
+            setPadding(0, 0, 0, dp(context, 8))
+        }
+        diagCard.addView(diagStatusText)
+
+        val diagButtonsRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            weightSum = 2f
+        }
+
+        val resetSessionsBtn = TextView(context).apply {
+            text = "⚡ Reset TorrServer"
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(context, 8), dp(context, 8), dp(context, 8), dp(context, 8))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1D4ED8"))
+                cornerRadius = dp(context, 8).toFloat()
+                setStroke(dp(context, 1), Color.parseColor("#38BDF8"))
+            }
+            setOnClickListener {
+                thread(isDaemon = true) {
+                    NordicBytesProvider.forceResetAllSessionsAndTorrServer()
+                    Handler(Looper.getMainLooper()).post {
+                        diagStatusText.text = "Last Tracker Status:\nSessions & TorrServer cache reset cleanly."
+                        Toast.makeText(context.applicationContext, "North: Sessions & TorrServer reset!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        diagButtonsRow.addView(
+            resetSessionsBtn,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = dp(context, 4)
+            }
+        )
+
+        val copyLogBtn = TextView(context).apply {
+            text = "📋 Copy Debug Log"
+            textSize = 11f
+            setTextColor(Color.parseColor("#DBEAFE"))
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(context, 8), dp(context, 8), dp(context, 8), dp(context, 8))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#0F2447"))
+                cornerRadius = dp(context, 8).toFloat()
+                setStroke(dp(context, 1), Color.parseColor("#2563EB"))
+            }
+            setOnClickListener {
+                try {
+                    val logText = buildString {
+                        append("=== North v48 Debug Log ===\n")
+                        append(NordicBytesProvider.getLastTrackerDiagnosticSummary()).append("\n\n")
+                        append(NorthDebugLogger.getRecentLines(120).joinToString("\n"))
+                    }
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("North Debug Log", logText))
+                    Toast.makeText(context.applicationContext, "Copied redacted debug log to clipboard!", Toast.LENGTH_SHORT).show()
+                } catch (_: Throwable) {
+                    Toast.makeText(context.applicationContext, "Could not copy debug log", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        diagButtonsRow.addView(
+            copyLogBtn,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = dp(context, 4)
+            }
+        )
+
+        diagCard.addView(diagButtonsRow)
+        root.addView(diagCard)
 
         var dialogInstance: AlertDialog? = null
 
