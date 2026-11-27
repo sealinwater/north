@@ -11,7 +11,7 @@ const port = Number(
   process.env.DEFAULT_APP_PORT ||
     (Number.isFinite(rawEnvPort) && rawEnvPort > 0 && rawEnvPort !== 8080 ? rawEnvPort : 3000)
 );
-const PLUGIN_VERSION = 46;
+const PLUGIN_VERSION = 47;
 
 interface CacheEntry<T> {
   expiresAt: number;
@@ -20,6 +20,65 @@ interface CacheEntry<T> {
 
 const skipsCache = new Map<string, CacheEntry<unknown>>();
 const subsCache = new Map<string, CacheEntry<unknown>>();
+const crashUploadRateMap = new Map<string, number[]>();
+const CRASH_LOGS_DIR = path.resolve(__dirname, 'crash_logs');
+const MAX_CRASH_BODY_BYTES = 128 * 1024;
+const MAX_STORED_CRASH_FILES = 50;
+
+function redactSensitiveText(input: string): string {
+  return input
+    .replace(/(api_token|token|passkey|password|pass|key)=([^&\s"']+)/gi, '$1=[REDACTED]')
+    .replace(/(Bearer\s+)([A-Za-z0-9._\-+/=]+)/gi, '$1[REDACTED]')
+    .replace(/(\/announce\/)([0-9a-f]{16,})/gi, '$1[REDACTED]')
+    .replace(/(\/torrents\/download\/\d+\.)([0-9a-f]{16,})/gi, '$1[REDACTED]');
+}
+
+function getClientIp(req: http.IncomingMessage): string {
+  const fwd = req.headers['x-forwarded-for'];
+  const first = Array.isArray(fwd) ? fwd[0] : fwd;
+  if (first) return first.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function isCrashUploadRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const windowMs = 10 * 60_000;
+  const recent = (crashUploadRateMap.get(ip) || []).filter((ts) => now - ts < windowMs);
+  if (recent.length >= 20) {
+    crashUploadRateMap.set(ip, recent);
+    return true;
+  }
+  recent.push(now);
+  crashUploadRateMap.set(ip, recent);
+  if (crashUploadRateMap.size > 500) {
+    const oldestKey = crashUploadRateMap.keys().next().value;
+    if (oldestKey !== undefined) crashUploadRateMap.delete(oldestKey);
+  }
+  return false;
+}
+
+function pruneCrashLogsDir(): void {
+  try {
+    if (!fs.existsSync(CRASH_LOGS_DIR)) return;
+    const files = fs
+      .readdirSync(CRASH_LOGS_DIR)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => {
+        const full = path.resolve(CRASH_LOGS_DIR, f);
+        const mtime = fs.existsSync(full) ? fs.statSync(full).mtimeMs : 0;
+        return { full, mtime };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    for (let i = MAX_STORED_CRASH_FILES; i < files.length; i++) {
+      const target = files[i].full;
+      if (target.startsWith(CRASH_LOGS_DIR + path.sep)) {
+        fs.unlinkSync(target);
+      }
+    }
+  } catch {
+    // Ignore pruning errors
+  }
+}
 
 function getCached<T>(map: Map<string, CacheEntry<T>>, key: string): T | null {
   const hit = map.get(key);
@@ -191,10 +250,135 @@ const server = http.createServer(async (req, res) => {
         subtitles: `${baseUrl}/api/subtitles`,
         torrent: `${baseUrl}/api/torrent`,
         proxy: `${baseUrl}/api/proxy`,
+        crashLog: `${baseUrl}/api/crash-log`,
+        crashLogs: `${baseUrl}/api/crash-logs`,
         plugins: `${baseUrl}/plugins.json`,
         repo: `${baseUrl}/repo.json`
       }
     });
+    return;
+  }
+
+  // 1B. Automatic Crash & Debug Log Ingestion (POST /api/crash-log) and Recent Listing (GET /api/crash-logs)
+  if (req.method === 'POST' && pathname === '/api/crash-log') {
+    const clientIp = getClientIp(req);
+    if (isCrashUploadRateLimited(clientIp)) {
+      sendJson(res, 429, { ok: false, error: 'Too many crash reports from this client' });
+      return;
+    }
+
+    let totalBytes = 0;
+    const chunks: Buffer[] = [];
+    let aborted = false;
+
+    req.on('data', (chunk: Buffer) => {
+      if (aborted) return;
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_CRASH_BODY_BYTES) {
+        aborted = true;
+        sendJson(res, 413, { ok: false, error: 'Crash report exceeds 128 KB limit' });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (aborted) return;
+      try {
+        const rawText = Buffer.concat(chunks).toString('utf-8').trim();
+        if (!rawText.startsWith('{')) {
+          sendJson(res, 400, { ok: false, error: 'Expected JSON object payload' });
+          return;
+        }
+        const parsed = JSON.parse(rawText) as Record<string, unknown>;
+        const sanitizedLogs = Array.isArray(parsed.recentLogs)
+          ? parsed.recentLogs.slice(-200).map((line) => redactSensitiveText(String(line ?? '')).slice(0, 1000))
+          : [];
+
+        const rawPlayerState = (parsed.playerState && typeof parsed.playerState === 'object')
+          ? (parsed.playerState as Record<string, unknown>)
+          : {};
+
+        const reportId = `crash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const sanitizedReport = {
+          id: reportId,
+          receivedAtUtc: new Date().toISOString(),
+          pluginVersion: Number(parsed.pluginVersion) || PLUGIN_VERSION,
+          reportType: redactSensitiveText(String(parsed.reportType || 'unknown')).slice(0, 48),
+          timestampUtc: redactSensitiveText(String(parsed.timestampUtc || '')).slice(0, 48),
+          device: redactSensitiveText(String(parsed.device || '')).slice(0, 120),
+          androidRelease: redactSensitiveText(String(parsed.androidRelease || '')).slice(0, 32),
+          androidSdk: Number(parsed.androidSdk) || 0,
+          threadName: redactSensitiveText(String(parsed.threadName || '')).slice(0, 80),
+          summary: redactSensitiveText(String(parsed.summary || '')).slice(0, 400),
+          exceptionClass: redactSensitiveText(String(parsed.exceptionClass || '')).slice(0, 160),
+          exceptionMessage: redactSensitiveText(String(parsed.exceptionMessage || '')).slice(0, 400),
+          stackTrace: redactSensitiveText(String(parsed.stackTrace || '')).slice(0, 6000),
+          playerState: {
+            stateSummary: redactSensitiveText(String(rawPlayerState.stateSummary || '')).slice(0, 240),
+            lastValidPositionMs: Number(rawPlayerState.lastValidPositionMs) || 0,
+            lastKnownDurationMs: Number(rawPlayerState.lastKnownDurationMs) || 0,
+            lastRequestedSeekMs: Number(rawPlayerState.lastRequestedSeekMs) || -1,
+            activeHashPrefix: redactSensitiveText(String(rawPlayerState.activeHashPrefix || '')).slice(0, 16)
+          },
+          recentLogs: sanitizedLogs
+        };
+
+        fs.mkdirSync(CRASH_LOGS_DIR, { recursive: true });
+        const safeFileName = `${reportId.replace(/[^a-zA-Z0-9_-]/g, '')}.json`;
+        const resolvedPath = path.resolve(CRASH_LOGS_DIR, safeFileName);
+        if (!resolvedPath.startsWith(CRASH_LOGS_DIR + path.sep)) {
+          sendJson(res, 400, { ok: false, error: 'Invalid report filename' });
+          return;
+        }
+        fs.writeFileSync(resolvedPath, JSON.stringify(sanitizedReport, null, 2), 'utf-8');
+        pruneCrashLogsDir();
+
+        console.error(
+          `[North CrashLog] ${sanitizedReport.reportType} v${sanitizedReport.pluginVersion} | ${sanitizedReport.summary}`
+        );
+        sendJson(res, 200, { ok: true, id: reportId });
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON payload' });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/crash-logs') {
+    try {
+      const limit = Math.min(25, Math.max(1, Number(parsedUrl.searchParams.get('limit') || '10')));
+      if (!fs.existsSync(CRASH_LOGS_DIR)) {
+        sendJson(res, 200, { ok: true, count: 0, reports: [] });
+        return;
+      }
+      const files = fs
+        .readdirSync(CRASH_LOGS_DIR)
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => {
+          const full = path.resolve(CRASH_LOGS_DIR, f);
+          const mtime = fs.existsSync(full) ? fs.statSync(full).mtimeMs : 0;
+          return { full, mtime };
+        })
+        .sort((a, b) => b.mtime - a.mtime)
+        .slice(0, limit);
+
+      const reports = files
+        .filter((entry) => entry.full.startsWith(CRASH_LOGS_DIR + path.sep))
+        .map((entry) => {
+          try {
+            return JSON.parse(fs.readFileSync(entry.full, 'utf-8'));
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      sendJson(res, 200, { ok: true, count: reports.length, reports });
+    } catch {
+      sendJson(res, 500, { ok: false, error: 'Failed reading crash logs' });
+    }
     return;
   }
 
