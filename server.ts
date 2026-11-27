@@ -11,7 +11,7 @@ const port = Number(
   process.env.DEFAULT_APP_PORT ||
     (Number.isFinite(rawEnvPort) && rawEnvPort > 0 && rawEnvPort !== 8080 ? rawEnvPort : 3000)
 );
-const PLUGIN_VERSION = 49;
+const PLUGIN_VERSION = 50;
 
 interface CacheEntry<T> {
   expiresAt: number;
