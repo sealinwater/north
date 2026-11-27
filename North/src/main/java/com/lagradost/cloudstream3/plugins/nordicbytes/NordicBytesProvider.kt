@@ -2722,19 +2722,43 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
         }
 
-        private fun loadPersistedCompactPeersForHash(hashHex: String): ByteArray? {
+        private fun loadPersistedCompactPeersWithAge(hashHex: String): Pair<ByteArray, Long>? {
             if (hashHex.isBlank()) return null
             return try {
                 val raw = getGhostSessionPrefs()?.getString("peers_$hashHex", null) ?: return null
                 val obj = JSONObject(raw)
                 val updatedAt = obj.optLong("updatedAt", 0L)
-                if (System.currentTimeMillis() - updatedAt > 24 * 3_600_000L) return null
+                val ageMs = (System.currentTimeMillis() - updatedAt).coerceAtLeast(0L)
+                if (ageMs > 24 * 3_600_000L) return null
                 val b64 = obj.optString("compactB64", "")
                 if (b64.isBlank()) return null
                 val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                if (bytes.size >= 6) bytes else null
+                if (bytes.size >= 6) Pair(bytes, ageMs) else null
             } catch (_: Throwable) {
                 null
+            }
+        }
+
+        private fun loadPersistedCompactPeersForHash(hashHex: String): ByteArray? {
+            return loadPersistedCompactPeersWithAge(hashHex)?.first
+        }
+
+        /**
+         * Inspects TorrServer's live loopback status (<2ms) to see if this torrent already has
+         * active peer/seeder connections so North can join the existing session directly instead
+         * of opening a duplicate tracker session.
+         */
+        private fun getActiveTorrServerPeerCount(hashHex: String): Int {
+            if (hashHex.isBlank()) return 0
+            return try {
+                val baseUrl = resolveRunningTorrServerUrl()
+                if (!baseUrl.startsWith("http")) return 0
+                val status = queryTorrServerStatus(baseUrl, hashHex) ?: return 0
+                val activePeers = status.optInt("active_peers", 0)
+                val connectedSeeders = status.optInt("connected_seeders", 0)
+                maxOf(activePeers, connectedSeeders)
+            } catch (_: Throwable) {
+                0
             }
         }
 
@@ -2908,8 +2932,33 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val sessionPeerKey = session.peerKey
                 val identParams = passthroughParams + listOf("port=$sessionPort", "peer_id=$sessionPeerId", "key=$sessionPeerKey")
 
-                // STEALTH CACHE: While live seedbox peers are fresh (<15 minutes), serve them directly from RAM
-                // without re-appearing on NordicBytes' tracker peer list during playback or episode switches!
+                // 1. CHECK FOR EXISTING ACTIVE CONNECTIONS:
+                // If TorrServer already has live connected peers/seeders for this torrent, join the current
+                // session directly to those peers instead of triggering a new upstream tracker session!
+                val activeConnCount = getActiveTorrServerPeerCount(infoHashHex)
+                val persistedWithAge = loadPersistedCompactPeersWithAge(infoHashHex)
+                if (activeConnCount > 0) {
+                    val existingReply = when {
+                        session.lastPeersResponse.isNotEmpty() && isValidTrackerPeersResponse(session.lastPeersResponse, effectiveSelfIpv4) ->
+                            session.lastPeersResponse
+                        persistedWithAge != null ->
+                            buildShortIntervalCompactPeersBencode(persistedWithAge.first, intervalSec = 45)
+                        else -> null
+                    }
+                    if (existingReply != null) {
+                        session.lastPeersResponse = existingReply
+                        session.lastUpstreamAttemptMs = now
+                        session.lastUpstreamReplyBytes = existingReply
+                        NorthDebugLogger.logTrackerEvent(
+                            infoHashHex,
+                            "Joined $activeConnCount existing active peer connection(s) directly (skipped new tracker session)"
+                        )
+                        return@synchronized existingReply
+                    }
+                }
+
+                // 2. STEALTH CACHE (RAM <15 min):
+                // While live seedbox peers are fresh in RAM, serve them directly without re-appearing on NordicBytes!
                 val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
                     (now - session.lastAnnounceMs) < 900_000L &&
                     isValidTrackerPeersResponse(session.lastPeersResponse, effectiveSelfIpv4)
@@ -2918,6 +2967,23 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     session.lastUpstreamAttemptMs = now
                     session.lastUpstreamReplyBytes = session.lastPeersResponse
                     return@synchronized session.lastPeersResponse
+                }
+
+                // 3. FRESH DISK SEEDBOX JOIN (<20 min after restart/episode switch):
+                // If we already fetched live seedboxes for this torrent within the last 20 minutes and have not
+                // stalled at 0 peers, join those peers directly without opening a new tracker session!
+                val priorZeroTimeouts = zeroPeerTimeoutCount[infoHashHex] ?: 0
+                if (persistedWithAge != null && persistedWithAge.second < 1_200_000L && priorZeroTimeouts == 0) {
+                    val rebuilt = buildShortIntervalCompactPeersBencode(persistedWithAge.first, intervalSec = 45)
+                    session.lastPeersResponse = rebuilt
+                    session.lastAnnounceMs = now
+                    session.lastUpstreamAttemptMs = now
+                    session.lastUpstreamReplyBytes = rebuilt
+                    NorthDebugLogger.logTrackerEvent(
+                        infoHashHex,
+                        "Joined ${persistedWithAge.first.size / 6} recently cached seedbox peer(s) directly (no new tracker session)"
+                    )
+                    return@synchronized rebuilt
                 }
 
                 // TRUE PEER REUSE:
@@ -9828,7 +9894,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val sessionTs = System.currentTimeMillis()
                     val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=51"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=52"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true

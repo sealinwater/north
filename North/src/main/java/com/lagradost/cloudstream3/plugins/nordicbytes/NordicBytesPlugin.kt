@@ -337,7 +337,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V51"
+            text = "NORTH • SEALINWATER • V52"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
@@ -856,7 +856,7 @@ class NordicBytesPlugin : Plugin() {
             setOnClickListener {
                 try {
                     val logText = buildString {
-                        append("=== North v51 Debug Log ===\n")
+                        append("=== North v52 Debug Log ===\n")
                         append(NordicBytesProvider.getLastTrackerDiagnosticSummary()).append("\n\n")
                         append(NorthDebugLogger.getRecentLines(120).joinToString("\n"))
                     }

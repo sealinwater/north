@@ -32,7 +32,7 @@ import kotlin.concurrent.thread
  */
 object NorthDebugLogger {
 
-    private const val PLUGIN_VERSION = 51
+    private const val PLUGIN_VERSION = 52
     private const val LOG_FILE_NAME = "north_debug.log"
     private const val PREV_LOG_FILE_NAME = "north_debug.prev.log"
     private const val PENDING_CRASH_FILE_NAME = "north_pending_crash.json"
