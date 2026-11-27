@@ -219,7 +219,7 @@ class NordicBytesPlugin : Plugin() {
         flCount: Int,
         doubleUpCount: Int
     ): String {
-        val ghostLabel = if (ghostRatio) "Active (0 B Download • Auto-Clear Leeching)" else "Disabled"
+        val ghostLabel = if (ghostRatio) "Active (Hidden from Peer List • 0 B Download)" else "Disabled"
         val modeLabel = if (freeleechOnly) "100% Freeleech Only" else "All Releases (Freeleech & 2x UP #1)"
         val bridgeLabel = if (hasSeedBridge) "Active (Auto-forwards played torrents)" else "Optional (Configure below)"
         return buildString {
@@ -337,7 +337,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V50"
+            text = "NORTH • SEALINWATER • V51"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
@@ -455,7 +455,7 @@ class NordicBytesPlugin : Plugin() {
         card.addView(input, inputParams)
 
         val ghostRatioSwitch = Switch(context).apply {
-            text = "Ghost Ratio Proxy (0 B Download & No Hit-and-Run)"
+            text = "Stealth Ghost Proxy (Hide from Peer List & 0 B Download)"
             setTextColor(Color.WHITE)
             textSize = 12.5f
             isChecked = currentGhostRatio
@@ -473,7 +473,7 @@ class NordicBytesPlugin : Plugin() {
         card.addView(freeleechSwitch)
 
         val freeleechNote = TextView(context).apply {
-            text = "Ghost Ratio Proxy intercepts tracker announces locally on 127.0.0.1 so Real & Credited Download stay 0 B and torrents auto-clear from Leeching."
+            text = "Stealth Ghost Proxy fetches live seedboxes locally and immediately leaves the tracker peer list with 0 B downloaded so your IP does not stay visible in the peer list and 0 peer slots remain open."
             textSize = 10.5f
             setTextColor(Color.parseColor("#93C5FD"))
         }
@@ -856,7 +856,7 @@ class NordicBytesPlugin : Plugin() {
             setOnClickListener {
                 try {
                     val logText = buildString {
-                        append("=== North v50 Debug Log ===\n")
+                        append("=== North v51 Debug Log ===\n")
                         append(NordicBytesProvider.getLastTrackerDiagnosticSummary()).append("\n\n")
                         append(NorthDebugLogger.getRecentLines(120).joinToString("\n"))
                     }

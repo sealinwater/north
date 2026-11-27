@@ -32,7 +32,7 @@ import kotlin.concurrent.thread
  */
 object NorthDebugLogger {
 
-    private const val PLUGIN_VERSION = 50
+    private const val PLUGIN_VERSION = 51
     private const val LOG_FILE_NAME = "north_debug.log"
     private const val PREV_LOG_FILE_NAME = "north_debug.prev.log"
     private const val PENDING_CRASH_FILE_NAME = "north_pending_crash.json"
@@ -80,6 +80,8 @@ object NorthDebugLogger {
     private val announcePasskeyRegex = Regex("""(?i)(/announce/)([0-9a-f]{16,})""")
     private val torrentPasskeyRegex = Regex("""(?i)(/torrents/download/\d+\.)([0-9a-f]{16,})""")
     private val privateProxyRegex = Regex("""(?i)https?://[^\s"'/]*(?:ais-(?:pre|dev)-|\.run\.app)[^\s"']*""")
+    private val ipv4Regex = Regex("""\b(?!(?:127\.0\.0\.1|0\.0\.0\.0)\b)(?:\d{1,3}\.){3}\d{1,3}\b""")
+    private val ipv6Regex = Regex("""(?i)\b(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}\b""")
 
     fun redactSecrets(raw: String): String {
         if (raw.isBlank()) return raw
@@ -89,6 +91,8 @@ object NorthDebugLogger {
         s = announcePasskeyRegex.replace(s, "$1[REDACTED]")
         s = torrentPasskeyRegex.replace(s, "$1[REDACTED]")
         s = privateProxyRegex.replace(s, "[PRIVATE_API]")
+        s = ipv4Regex.replace(s, "[REDACTED_IP]")
+        s = ipv6Regex.replace(s, "[REDACTED_IP]")
         return s
     }
 
@@ -99,7 +103,7 @@ object NorthDebugLogger {
 
         if (initialized.compareAndSet(false, true)) {
             loadTailFromDiskIntoRing()
-            log("INFO", "LIFECYCLE", "NorthDebugLogger initialized (v$PLUGIN_VERSION, Android ${Build.VERSION.RELEASE} / SDK ${Build.VERSION.SDK_INT}, ${Build.MANUFACTURER} ${Build.MODEL})")
+            log("INFO", "LIFECYCLE", "NorthDebugLogger initialized (v$PLUGIN_VERSION)")
         }
 
         installUncaughtCrashHandler()
@@ -234,9 +238,9 @@ object NorthDebugLogger {
             put("pluginVersion", PLUGIN_VERSION)
             put("reportType", reportType)
             put("timestampUtc", isoFormat.get()?.format(Date()) ?: System.currentTimeMillis().toString())
-            put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
-            put("androidRelease", Build.VERSION.RELEASE ?: "")
-            put("androidSdk", Build.VERSION.SDK_INT)
+            put("device", "Android")
+            put("androidRelease", "redacted")
+            put("androidSdk", 0)
             put("threadName", threadName.take(80))
             put("summary", redactSecrets(customSummary).take(400))
             put("exceptionClass", throwable?.javaClass?.name.orEmpty().take(160))

@@ -659,8 +659,47 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
         }
 
+        private fun sendStoppedForAllPersistedActivePeersSync() {
+            try {
+                val prefs = getGhostSessionPrefs() ?: return
+                val all = prefs.all ?: return
+                var closedCount = 0
+                for ((k, v) in all) {
+                    if (!k.startsWith("sess_")) continue
+                    val raw = v as? String ?: continue
+                    val obj = try { JSONObject(raw) } catch (_: Throwable) { null } ?: continue
+                    if (!obj.optBoolean("active", false)) continue
+                    val hashHex = k.removePrefix("sess_")
+                    val upstream = obj.optString("upstreamUrl", "").trim()
+                    val rawHashParam = obj.optString("rawInfoHashParam", "").trim()
+                    val peerId = obj.optString("peerId", "").trim()
+                    val peerKey = obj.optString("peerKey", "").trim()
+                    val peerPort = obj.optInt("peerPort", deriveDeterministicQbitPort(hashHex))
+                    val declaredSize = obj.optLong("declaredSize", 1_610_612_736L).coerceAtLeast(536_870_912L)
+                    if (upstream.startsWith("http") && rawHashParam.isNotBlank() && peerId.isNotBlank()) {
+                        val sep = if (upstream.contains("?")) "&" else "?"
+                        val stopUrl = "$upstream$sep$rawHashParam&port=$peerPort&peer_id=$peerId&key=$peerKey" +
+                            "&uploaded=0&downloaded=0&corrupt=0&left=$declaredSize&numwant=0&compact=1&event=stopped"
+                        try {
+                            executeTrackerGet(stopUrl, 1400)
+                            closedCount++
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    obj.put("active", false)
+                    obj.put("updatedAt", System.currentTimeMillis())
+                    prefs.edit().putString(k, obj.toString()).commit()
+                }
+                if (closedCount > 0) {
+                    NorthDebugLogger.log("INFO", "RESET", "Closed $closedCount open tracker peer(s) via event=stopped")
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
         fun forceResetAllSessionsAndTorrServer() {
             NorthDebugLogger.log("INFO", "RESET", "User triggered Force Reset of tracker sessions & TorrServer")
+            sendStoppedForAllPersistedActivePeersSync()
             try {
                 val baseUrl = resolveRunningTorrServerUrl()
                 val allHashes = LinkedHashSet<String>()
@@ -827,7 +866,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             @Volatile var peerId: String = generateQbitPeerId(),
             @Volatile var peerKey: String = generateQbitKey(),
             @Volatile var peerPort: Int = 51413,
-            @Volatile var needsFreshPeerId: Boolean = false,
+            @Volatile var isPeerOpenOnTracker: Boolean = false,
+            @Volatile var upstreamUrl: String = "",
+            @Volatile var rawInfoHashParam: String = "",
             @Volatile var lastStoppedAtMs: Long = 0L,
             @Volatile var lastUpstreamAttemptMs: Long = 0L,
             @Volatile var lastUpstreamReplyBytes: ByteArray = ByteArray(0)
@@ -2128,8 +2169,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             val healthJson = JSONObject().apply {
                                 put("ok", true)
                                 put("service", "north-local-proxy")
-                                put("port", localPort)
-                                put("torrServer", torrBase)
                                 put("torrServerAlive", isTorrServerAlive(torrBase))
                             }.toString()
                             sendHttpResponse(sock, 200, "application/json; charset=utf-8", healthJson.toByteArray(Charsets.UTF_8))
@@ -2631,8 +2670,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             hashHex: String,
             peerId: String,
             peerKey: String,
+            peerPort: Int,
             uploadedBytes: Long,
-            active: Boolean
+            active: Boolean,
+            upstreamUrl: String = "",
+            rawInfoHashParam: String = ""
         ) {
             if (hashHex.isBlank()) return
             try {
@@ -2640,8 +2682,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val obj = JSONObject().apply {
                     put("peerId", peerId)
                     put("peerKey", peerKey)
+                    put("peerPort", peerPort)
                     put("uploaded", uploadedBytes)
                     put("active", active)
+                    if (upstreamUrl.isNotBlank()) put("upstreamUrl", upstreamUrl)
+                    if (rawInfoHashParam.isNotBlank()) put("rawInfoHashParam", rawInfoHashParam)
                     put("updatedAt", System.currentTimeMillis())
                 }
                 prefs.edit().putString("sess_$hashHex", obj.toString()).commit()
@@ -2768,6 +2813,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
                     val savedPeerId = persisted?.optString("peerId", "").orEmpty().ifBlank { detPeerId }
                     val savedPeerKey = persisted?.optString("peerKey", "").orEmpty().ifBlank { detPeerKey }
+                    val savedPort = persisted?.optInt("peerPort", detPort)?.takeIf { it in 1024..65535 } ?: detPort
                     val savedActive = persisted?.optBoolean("active", false) == true
                     val savedUpload = persisted?.optLong("uploaded", baseUpload)?.coerceAtLeast(baseUpload) ?: baseUpload
                     val savedCompact = loadPersistedCompactPeersForHash(infoHashHex)
@@ -2777,54 +2823,64 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         lastPeersResponse = if (savedCompact != null) buildShortIntervalCompactPeersBencode(savedCompact, intervalSec = 25) else ByteArray(0),
                         peerId = savedPeerId,
                         peerKey = savedPeerKey,
-                        peerPort = detPort,
-                        // Always stop any prior active/crashed deterministic peer_id first so UNIT3D resets it in <200ms!
-                        needsFreshPeerId = savedActive || persisted != null
+                        peerPort = savedPort,
+                        // If a peer is ALREADY open on NordicBytes, REUSE IT directly instead of abandoning or recreating it!
+                        isPeerOpenOnTracker = savedActive,
+                        upstreamUrl = upstreamUrl,
+                        rawInfoHashParam = rawInfoHashParam
                     )
                     ghostSessions[sessionHashKey] = created
                     created
                 }
+                session.upstreamUrl = upstreamUrl
+                if (rawInfoHashParam.isNotBlank()) session.rawInfoHashParam = rawInfoHashParam
 
                 val now = System.currentTimeMillis()
                 val sessionPort = session.peerPort
 
-                // When TorrServer stops playback, report final boosted upload + downloaded=0 + left=0 + event=stopped
-                // ONCE synchronously (1.2s cap) using our deterministic peer_id + port so UNIT3D clears the row cleanly.
+                // When TorrServer stops playback, cleanly close any open peer with 0 B downloaded & left>0 (no HnR!)
                 if (eventValue == "stopped") {
-                    val finalUpload = session.cumulativeUploadedBytes
                     val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
                     val stopPeerId = session.peerId
                     val stopPeerKey = session.peerKey
-                    val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
-                    session.peerId = detPeerId
-                    session.peerKey = detPeerKey
-                    session.peerPort = detPort
+                    val wasOpen = session.isPeerOpenOnTracker
                     session.lastAnnounceMs = 0L
                     session.lastUpstreamAttemptMs = 0L
                     session.lastUpstreamReplyBytes = ByteArray(0)
                     session.promotedToSeeder = false
-                    session.needsFreshPeerId = false
-                    persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, finalUpload, active = false)
-                    val stopQuery = (
-                        passthroughParams + listOf(
-                            "port=$sessionPort",
-                            "peer_id=$stopPeerId",
-                            "key=$stopPeerKey",
-                            "uploaded=$finalUpload",
-                            "downloaded=0",
-                            "corrupt=0",
-                            "left=0",
-                            "numwant=0",
-                            "compact=1",
-                            "event=stopped"
-                        )
-                        ).joinToString("&")
-                    try {
-                        executeTrackerGet("$upstreamUrl$sep$stopQuery", 1200)
-                    } catch (_: Throwable) {
+                    session.isPeerOpenOnTracker = false
+                    persistGhostPeerSession(
+                        hashHex = infoHashHex,
+                        peerId = stopPeerId,
+                        peerKey = stopPeerKey,
+                        peerPort = sessionPort,
+                        uploadedBytes = 0L,
+                        active = false,
+                        upstreamUrl = upstreamUrl,
+                        rawInfoHashParam = rawInfoHashParam
+                    )
+                    if (wasOpen) {
+                        val stopQuery = (
+                            passthroughParams + listOf(
+                                "port=$sessionPort",
+                                "peer_id=$stopPeerId",
+                                "key=$stopPeerKey",
+                                "uploaded=0",
+                                "downloaded=0",
+                                "corrupt=0",
+                                "left=$declaredTorrentSize",
+                                "numwant=0",
+                                "compact=1",
+                                "event=stopped"
+                            )
+                            ).joinToString("&")
+                        try {
+                            executeTrackerGet("$upstreamUrl$sep$stopQuery", 1200)
+                        } catch (_: Throwable) {
+                        }
+                        session.lastStoppedAtMs = System.currentTimeMillis()
+                        NorthDebugLogger.logTrackerEvent(infoHashHex, "Closed peer cleanly via event=stopped")
                     }
-                    session.lastStoppedAtMs = System.currentTimeMillis()
-                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Sent event=stopped cleanly (port=$sessionPort)")
                     return@synchronized cachedReply
                 }
 
@@ -2837,26 +2893,142 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     return@synchronized session.lastUpstreamReplyBytes
                 }
 
-                // If this session was previously active (e.g. promoted to seeder OR left orphaned by a crash on disk),
-                // cleanly stop that exact deterministic peer_id + port FIRST so UNIT3D resets the peer row immediately.
-                if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.needsFreshPeerId) {
-                    val oldPeerId = session.peerId
-                    val oldPeerKey = session.peerKey
-                    val oldUpload = session.cumulativeUploadedBytes
-                    val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
-                    session.peerId = detPeerId
-                    session.peerKey = detPeerKey
-                    session.peerPort = detPort
-                    session.needsFreshPeerId = false
+                // Brief spacing right after an explicit event=stopped so tracker never rejects an immediate event=started
+                if (session.lastStoppedAtMs > 0L) {
+                    val sinceStopMs = System.currentTimeMillis() - session.lastStoppedAtMs
+                    if (sinceStopMs in 0L..449L) {
+                        try {
+                            Thread.sleep(450L - sinceStopMs)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
+                val sessionPeerId = session.peerId
+                val sessionPeerKey = session.peerKey
+                val identParams = passthroughParams + listOf("port=$sessionPort", "peer_id=$sessionPeerId", "key=$sessionPeerKey")
+
+                // STEALTH CACHE: While live seedbox peers are fresh (<15 minutes), serve them directly from RAM
+                // without re-appearing on NordicBytes' tracker peer list during playback or episode switches!
+                val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
+                    (now - session.lastAnnounceMs) < 900_000L &&
+                    isValidTrackerPeersResponse(session.lastPeersResponse, effectiveSelfIpv4)
+
+                if (cacheIsFresh) {
+                    session.lastUpstreamAttemptMs = now
+                    session.lastUpstreamReplyBytes = session.lastPeersResponse
+                    return@synchronized session.lastPeersResponse
+                }
+
+                // TRUE PEER REUSE:
+                // If our deterministic peer is ALREADY open on NordicBytes (`isPeerOpenOnTracker == true`),
+                // do NOT send `event=started` and do NOT close+reopen it — send a plain re-announce so
+                // Stardust/UNIT3D reuses that EXACT existing open peer row in place!
+                val reusingExistingPeer = session.isPeerOpenOnTracker
+                val sendStartedEvent = !reusingExistingPeer && (eventValue == "started" || session.lastAnnounceMs == 0L)
+                if (sendStartedEvent || (now - session.lastAnnounceMs) >= 45_000L) {
                     session.promotedToSeeder = false
-                    persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, oldUpload, active = false)
+                }
+
+                // Persist our active peer identity BEFORE announcing so even an instant crash lets the
+                // very next launch reuse or cleanly close this exact open peer!
+                persistGhostPeerSession(
+                    hashHex = infoHashHex,
+                    peerId = sessionPeerId,
+                    peerKey = sessionPeerKey,
+                    peerPort = sessionPort,
+                    uploadedBytes = session.cumulativeUploadedBytes,
+                    active = true,
+                    upstreamUrl = upstreamUrl,
+                    rawInfoHashParam = rawInfoHashParam
+                )
+                session.isPeerOpenOnTracker = true
+
+                // Peer discovery announce (`left > 0` so tracker returns ALL live seedboxes!)
+                val peerDiscoveryLeft = if (clientLeftParam.isNotBlank() && clientLeftParam != "left=0") {
+                    clientLeftParam
+                } else {
+                    "left=$declaredTorrentSize"
+                }
+
+                val announceQueryList = identParams.toMutableList().apply {
+                    add("uploaded=0")
+                    add("downloaded=0")
+                    add("corrupt=0")
+                    add(peerDiscoveryLeft)
+                    add("numwant=200")
+                    add("compact=1")
+                    if (sendStartedEvent) {
+                        add("event=started")
+                    }
+                }
+
+                val fullAnnounceUrl = "$upstreamUrl$sep${announceQueryList.joinToString("&")}"
+                var rawTrackerResp = executeTrackerGet(fullAnnounceUrl, 9000)
+                var inspection = inspectTrackerPeersResponse(rawTrackerResp, effectiveSelfIpv4)
+
+                // If tracker returned peers from only 1 distinct IPv4 and we haven't cached our own public IP yet,
+                // check our public IPv4 right now (max 1.5s) so self-IP-only swarms are never mistaken for live seedboxes!
+                if (!inspection.hasFailureReason && effectiveSelfIpv4.isBlank() && inspection.distinctIpv4s.size == 1) {
+                    val detected = detectPublicIpv4Sync(1500)
+                    if (detected.isNotBlank()) {
+                        effectiveSelfIpv4 = detected
+                        inspection = inspectTrackerPeersResponse(rawTrackerResp, effectiveSelfIpv4)
+                    }
+                }
+
+                var validExternalPeersFound = !inspection.hasFailureReason && inspection.externalPeers > 0
+
+                val reasonLower = inspection.failureReason.lowercase(Locale.ROOT)
+                val isAlreadyActiveRejection = inspection.hasFailureReason && (
+                    reasonLower.contains("already") ||
+                        reasonLower.contains("active download") ||
+                        reasonLower.contains("slot") ||
+                        reasonLower.contains("duplicate")
+                    )
+                val isFatalTrackerRejection = inspection.hasFailureReason && !isAlreadyActiveRejection && (
+                    reasonLower.contains("unregistered") ||
+                        reasonLower.contains("not registered") ||
+                        reasonLower.contains("banned") ||
+                        reasonLower.contains("passkey") ||
+                        reasonLower.contains("unauthorized")
+                    )
+                val isIntervalRateLimit = inspection.hasFailureReason && (
+                    reasonLower.contains("interval") || reasonLower.contains("too fast") || reasonLower.contains("wait")
+                    )
+
+                // If tracker rejected `event=started` with "You already...", FIRST try reusing the existing open peer
+                // directly with a plain re-announce (NO event=started, NO event=stopped)!
+                if (!validExternalPeersFound && isAlreadyActiveRejection && sendStartedEvent) {
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Tracker reported open peer (${inspection.failureReason}); reusing existing peer directly")
                     try {
-                        val cleanupStopQuery = (
-                            passthroughParams + listOf(
-                                "port=$sessionPort",
-                                "peer_id=$oldPeerId",
-                                "key=$oldPeerKey",
-                                "uploaded=$oldUpload",
+                        val reuseList = identParams.toMutableList().apply {
+                            add("uploaded=0")
+                            add("downloaded=0")
+                            add("corrupt=0")
+                            add(peerDiscoveryLeft)
+                            add("numwant=200")
+                            add("compact=1")
+                        }
+                        val reuseResp = executeTrackerGet("$upstreamUrl$sep${reuseList.joinToString("&")}", 7000)
+                        val reuseInsp = inspectTrackerPeersResponse(reuseResp, effectiveSelfIpv4)
+                        if (!reuseInsp.hasFailureReason && reuseInsp.externalPeers > 0 && reuseResp != null) {
+                            rawTrackerResp = reuseResp
+                            inspection = reuseInsp
+                            validExternalPeersFound = true
+                            NorthDebugLogger.logTrackerEvent(infoHashHex, "Reused existing open peer cleanly (${reuseInsp.externalPeers} seeders)")
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+
+                // If direct reuse still returned "You already...", send event=stopped for our deterministic peer once + retry
+                if (!validExternalPeersFound && isAlreadyActiveRejection) {
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Tracker peer-limit rejection: ${inspection.failureReason}")
+                    try {
+                        val stopExistingQuery = (
+                            identParams + listOf(
+                                "uploaded=${session.cumulativeUploadedBytes}",
                                 "downloaded=0",
                                 "corrupt=0",
                                 "left=0",
@@ -2865,147 +3037,33 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                 "event=stopped"
                             )
                             ).joinToString("&")
-                        val stopResp = executeTrackerGet("$upstreamUrl$sep$cleanupStopQuery", 1400)
-                        val stopInsp = inspectTrackerPeersResponse(stopResp, effectiveSelfIpv4)
-                        val stopNote = if (stopInsp.hasFailureReason) "reply=${stopInsp.failureReason.take(60)}" else "ok"
-                        NorthDebugLogger.logTrackerEvent(infoHashHex, "Auto-cleared prior peer session via event=stopped (port=$sessionPort, $stopNote)")
+                        executeTrackerGet("$upstreamUrl$sep$stopExistingQuery", 1400)
+                        Thread.sleep(500L)
+                        val recoveryList = identParams.toMutableList().apply {
+                            add("uploaded=0")
+                            add("downloaded=0")
+                            add("corrupt=0")
+                            add(peerDiscoveryLeft)
+                            add("numwant=200")
+                            add("compact=1")
+                        }
+                        val recResp = executeTrackerGet("$upstreamUrl$sep${recoveryList.joinToString("&")}", 7000)
+                        val recInsp = inspectTrackerPeersResponse(recResp, effectiveSelfIpv4)
+                        if (!recInsp.hasFailureReason && recInsp.externalPeers > 0 && recResp != null) {
+                            rawTrackerResp = recResp
+                            inspection = recInsp
+                            validExternalPeersFound = true
+                            NorthDebugLogger.logTrackerEvent(infoHashHex, "Recovered peer session cleanly (${recInsp.externalPeers} seeders)")
+                        }
                     } catch (_: Throwable) {
                     }
-                    session.lastStoppedAtMs = System.currentTimeMillis()
                 }
 
-                // Brief spacing after event=stopped so UNIT3D never rejects an immediate event=started for the same passkey
-                if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.lastStoppedAtMs > 0L) {
-                    val sinceStopMs = System.currentTimeMillis() - session.lastStoppedAtMs
-                    if (sinceStopMs in 0L..549L) {
-                        try {
-                            Thread.sleep(550L - sinceStopMs)
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-
-                val sessionPeerId = session.peerId
-                val sessionPeerKey = session.peerKey
-                val identParams = passthroughParams + listOf("port=${session.peerPort}", "peer_id=$sessionPeerId", "key=$sessionPeerKey")
-
-                val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
-
-                // Always fetch fresh peers on `event=started` (outside the 15s single-flight window) or whenever
-                // cached peers are >45 seconds old. Within 45s, serve cached peers to non-`started` announces.
-                val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
-                    eventValue != "started" &&
-                    (now - session.lastAnnounceMs) < 45_000L
-
-                if (cacheIsFresh) {
-                    if (now - session.lastAnnounceMs >= 120_000L) {
-                        session.lastAnnounceMs = now
-                        val updatedUpload = session.cumulativeUploadedBytes + (elapsedSec * 18_874_368L)
-                        if (updatedUpload > session.cumulativeUploadedBytes) {
-                            session.cumulativeUploadedBytes = updatedUpload
-                        }
-                        thread(isDaemon = true, name = "North-SeederHeartbeat") {
-                            try {
-                                val heartbeatQuery = (
-                                    identParams + listOf(
-                                        "uploaded=${session.cumulativeUploadedBytes}",
-                                        "downloaded=0",
-                                        "corrupt=0",
-                                        "left=0",
-                                        "numwant=50",
-                                        "compact=1"
-                                    )
-                                    ).joinToString("&")
-                                executeTrackerGet("$upstreamUrl$sep$heartbeatQuery", 7000)
-                            } catch (_: Exception) {
-                            }
-                        }
-                    }
-                    return@synchronized session.lastPeersResponse
-                }
-
-                val sendStartedEvent = eventValue == "started" || session.lastAnnounceMs == 0L
-                if (sendStartedEvent || (now - session.lastAnnounceMs) >= 45_000L) {
-                    session.promotedToSeeder = false
-                }
-
-            // Persist our active peer_id BEFORE sending event=started so even an immediate process crash
-            // lets the very next launch cleanly send event=stopped for this exact peer_id!
-            persistGhostPeerSession(infoHashHex, sessionPeerId, sessionPeerKey, session.cumulativeUploadedBytes, active = true)
-
-            // Initial peer discovery announce (`left > 0` so tracker returns ALL seedboxes!)
-            val peerDiscoveryLeft = if (clientLeftParam.isNotBlank() && clientLeftParam != "left=0") {
-                clientLeftParam
-            } else {
-                "left=$declaredTorrentSize"
-            }
-
-            val announceQueryList = identParams.toMutableList().apply {
-                add("uploaded=0")
-                add("downloaded=0")
-                add("corrupt=0")
-                add(peerDiscoveryLeft)
-                add("numwant=200")
-                add("compact=1")
-                if (sendStartedEvent) {
-                    add("event=started")
-                }
-            }
-
-            val fullAnnounceUrl = "$upstreamUrl$sep${announceQueryList.joinToString("&")}"
-            var rawTrackerResp = executeTrackerGet(fullAnnounceUrl, 9000)
-            var inspection = inspectTrackerPeersResponse(rawTrackerResp, effectiveSelfIpv4)
-
-            // If tracker returned peers from only 1 distinct IPv4 and we haven't cached our own public IP yet,
-            // check our public IPv4 right now (max 1.5s) so self-IP-only swarms are never mistaken for live seedboxes!
-            if (!inspection.hasFailureReason && effectiveSelfIpv4.isBlank() && inspection.distinctIpv4s.size == 1) {
-                val detected = detectPublicIpv4Sync(1500)
-                if (detected.isNotBlank()) {
-                    effectiveSelfIpv4 = detected
-                    inspection = inspectTrackerPeersResponse(rawTrackerResp, effectiveSelfIpv4)
-                }
-            }
-
-            var validExternalPeersFound = !inspection.hasFailureReason && inspection.externalPeers > 0
-
-            val reasonLower = inspection.failureReason.lowercase(Locale.ROOT)
-            val isAlreadyActiveRejection = inspection.hasFailureReason && (
-                reasonLower.contains("already") ||
-                    reasonLower.contains("active download") ||
-                    reasonLower.contains("slot") ||
-                    reasonLower.contains("duplicate")
-                )
-            val isFatalTrackerRejection = inspection.hasFailureReason && !isAlreadyActiveRejection && (
-                reasonLower.contains("unregistered") ||
-                    reasonLower.contains("not registered") ||
-                    reasonLower.contains("banned") ||
-                    reasonLower.contains("passkey") ||
-                    reasonLower.contains("unauthorized")
-                )
-            val isIntervalRateLimit = inspection.hasFailureReason && (
-                reasonLower.contains("interval") || reasonLower.contains("too fast") || reasonLower.contains("wait")
-                )
-
-            // If UNIT3D rejected with "You already..." (e.g. orphaned peer row after an earlier crash),
-            // attempt an explicit event=stopped on our current peer_id + brief pause + non-started announce
-            // so we recover automatically whenever possible!
-            if (!validExternalPeersFound && isAlreadyActiveRejection) {
-                NorthDebugLogger.logTrackerEvent(infoHashHex, "Tracker duplicate-session rejection: ${inspection.failureReason}")
-                try {
-                    val stopExistingQuery = (
-                        identParams + listOf(
-                            "uploaded=${session.cumulativeUploadedBytes}",
-                            "downloaded=0",
-                            "corrupt=0",
-                            "left=0",
-                            "numwant=0",
-                            "compact=1",
-                            "event=stopped"
-                        )
-                        ).joinToString("&")
-                    executeTrackerGet("$upstreamUrl$sep$stopExistingQuery", 1400)
-                    Thread.sleep(600L)
-                    val recoveryList = identParams.toMutableList().apply {
+                // Only retry without event=started when the tracker actually returned null/invalid/non-fatal error
+                if (!validExternalPeersFound && sendStartedEvent && !isFatalTrackerRejection && !isIntervalRateLimit && !isAlreadyActiveRejection &&
+                    (rawTrackerResp == null || inspection.hasFailureReason)
+                ) {
+                    val regularAnnounceList = identParams.toMutableList().apply {
                         add("uploaded=0")
                         add("downloaded=0")
                         add("corrupt=0")
@@ -3013,132 +3071,122 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                         add("numwant=200")
                         add("compact=1")
                     }
-                    val recResp = executeTrackerGet("$upstreamUrl$sep${recoveryList.joinToString("&")}", 7000)
-                    val recInsp = inspectTrackerPeersResponse(recResp, effectiveSelfIpv4)
-                    if (!recInsp.hasFailureReason && recInsp.externalPeers > 0 && recResp != null) {
-                        rawTrackerResp = recResp
-                        inspection = recInsp
+                    val retryResp = executeTrackerGet("$upstreamUrl$sep${regularAnnounceList.joinToString("&")}", 7000)
+                    val retryInspection = inspectTrackerPeersResponse(retryResp, effectiveSelfIpv4)
+                    if (!retryInspection.hasFailureReason && retryInspection.externalPeers > 0 && retryResp != null) {
+                        rawTrackerResp = retryResp
+                        inspection = retryInspection
                         validExternalPeersFound = true
-                        NorthDebugLogger.logTrackerEvent(infoHashHex, "Recovered from duplicate-session rejection (${recInsp.externalPeers} external peers)")
-                    }
-                } catch (_: Throwable) {
-                }
-            }
-
-            // Only retry without event=started when the tracker actually returned null/invalid/non-fatal error
-            // (never hammer UNIT3D twice in 100ms when it already returned a valid bencoded peer list).
-            if (!validExternalPeersFound && sendStartedEvent && !isFatalTrackerRejection && !isIntervalRateLimit && !isAlreadyActiveRejection &&
-                (rawTrackerResp == null || inspection.hasFailureReason)
-            ) {
-                val regularAnnounceList = identParams.toMutableList().apply {
-                    add("uploaded=0")
-                    add("downloaded=0")
-                    add("corrupt=0")
-                    add(peerDiscoveryLeft)
-                    add("numwant=200")
-                    add("compact=1")
-                }
-                val retryResp = executeTrackerGet("$upstreamUrl$sep${regularAnnounceList.joinToString("&")}", 7000)
-                val retryInspection = inspectTrackerPeersResponse(retryResp, effectiveSelfIpv4)
-                if (!retryInspection.hasFailureReason && retryInspection.externalPeers > 0 && retryResp != null) {
-                    rawTrackerResp = retryResp
-                    inspection = retryInspection
-                    validExternalPeersFound = true
-                } else if (inspection.totalPeers == 0 && !retryInspection.hasFailureReason && retryInspection.totalPeers > 0 && retryResp != null) {
-                    rawTrackerResp = retryResp
-                    inspection = retryInspection
-                }
-            }
-
-            if (infoHashHex.isNotBlank()) {
-                val diagStr = when {
-                    inspection.hasFailureReason -> "tracker: ${inspection.failureReason.take(90)}"
-                    validExternalPeersFound -> "${inspection.externalPeers} seeders"
-                    inspection.selfIpPeers > 0 -> "only own IP (${inspection.selfIpPeers})"
-                    else -> "0 peers from tracker"
-                }
-                lastTrackerDiagByHash[infoHashHex] = diagStr
-                NorthDebugLogger.logTrackerEvent(infoHashHex, "Announce result: $diagStr")
-                if (isFatalTrackerRejection) {
-                    deadSwarmHashes[infoHashHex] = now
-                    noExternalPeersHashes[infoHashHex] = now
-                }
-            }
-
-            val persistedCompactFallback = if (!validExternalPeersFound) loadPersistedCompactPeersForHash(infoHashHex) else null
-
-            val peerBytes = if (validExternalPeersFound && rawTrackerResp != null) {
-                if (infoHashHex.isNotBlank()) {
-                    noExternalPeersHashes.remove(infoHashHex)
-                    deadSwarmHashes.remove(infoHashHex)
-                }
-                session.lastPeersResponse = rawTrackerResp
-                session.lastAnnounceMs = now
-                persistCompactPeersForHash(infoHashHex, inspection.compactPeersRaw)
-                rawTrackerResp
-            } else if (session.lastPeersResponse.isNotEmpty() && isValidTrackerPeersResponse(session.lastPeersResponse, effectiveSelfIpv4)) {
-                NorthDebugLogger.logTrackerEvent(infoHashHex, "Reusing RAM cached external peers after tracker error/empty reply")
-                session.lastPeersResponse
-            } else if (persistedCompactFallback != null) {
-                NorthDebugLogger.logTrackerEvent(infoHashHex, "Reusing disk-persisted seedbox peers (${persistedCompactFallback.size / 6} peers) after tracker rejection")
-                val rebuilt = buildShortIntervalCompactPeersBencode(persistedCompactFallback, intervalSec = 25)
-                session.lastPeersResponse = rebuilt
-                rebuilt
-            } else {
-                if (infoHashHex.isNotBlank()) {
-                    noExternalPeersHashes[infoHashHex] = now
-                    if (isAlreadyActiveRejection) {
-                        alreadyActiveRejectionHashes[infoHashHex] = now
-                        showDeadSwarmToastThrottled(
-                            infoHashHex,
-                            "North: NordicBytes tracker locked (${inspection.failureReason.take(90)}). Wait for auto-expiry or see North Settings.",
-                            postFollowUp = true
-                        )
-                        NorthDebugLogger.reportHandledFatalAsync(
-                            "TRACKER_ALREADY_ACTIVE",
-                            "NordicBytes rejected announce for ${infoHashHex.take(10)}: ${inspection.failureReason}",
-                            null
-                        )
+                    } else if (inspection.totalPeers == 0 && !retryInspection.hasFailureReason && retryInspection.totalPeers > 0 && retryResp != null) {
+                        rawTrackerResp = retryResp
+                        inspection = retryInspection
                     }
                 }
-                // If tracker only returned self-IP peers (e.g. stale local sessions), pass them with a short 20s
-                // interval so TorrServer never sleeps for 30 minutes while our fast-fail switches sources cleanly.
-                val selfCompact = inspection.compactPeersRaw
-                if (!inspection.hasFailureReason && selfCompact != null && selfCompact.size >= 6) {
-                    buildShortIntervalCompactPeersBencode(selfCompact, intervalSec = 20)
+
+                if (infoHashHex.isNotBlank()) {
+                    val modeTag = if (reusingExistingPeer) "reused peer" else "opened peer"
+                    val diagStr = when {
+                        inspection.hasFailureReason -> "tracker: ${inspection.failureReason.take(90)}"
+                        validExternalPeersFound -> "${inspection.externalPeers} seeders ($modeTag, port=$sessionPort)"
+                        inspection.selfIpPeers > 0 -> "only own IP (${inspection.selfIpPeers})"
+                        else -> "0 peers from tracker"
+                    }
+                    lastTrackerDiagByHash[infoHashHex] = diagStr
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Announce result: $diagStr")
+                    if (isFatalTrackerRejection) {
+                        deadSwarmHashes[infoHashHex] = now
+                        noExternalPeersHashes[infoHashHex] = now
+                    }
+                }
+
+                val persistedCompactFallback = if (!validExternalPeersFound) loadPersistedCompactPeersForHash(infoHashHex) else null
+
+                val peerBytes = if (validExternalPeersFound && rawTrackerResp != null) {
+                    if (infoHashHex.isNotBlank()) {
+                        noExternalPeersHashes.remove(infoHashHex)
+                        deadSwarmHashes.remove(infoHashHex)
+                    }
+                    session.lastPeersResponse = rawTrackerResp
+                    session.lastAnnounceMs = now
+                    persistCompactPeersForHash(infoHashHex, inspection.compactPeersRaw)
+                    rawTrackerResp
+                } else if (session.lastPeersResponse.isNotEmpty() && isValidTrackerPeersResponse(session.lastPeersResponse, effectiveSelfIpv4)) {
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Reusing RAM cached seedbox peers after tracker error/empty reply")
+                    session.lastPeersResponse
+                } else if (persistedCompactFallback != null) {
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Reusing disk-persisted seedbox peers (${persistedCompactFallback.size / 6} peers) after tracker rejection")
+                    val rebuilt = buildShortIntervalCompactPeersBencode(persistedCompactFallback, intervalSec = 25)
+                    session.lastPeersResponse = rebuilt
+                    rebuilt
                 } else {
-                    emptyPeersBencode
+                    if (infoHashHex.isNotBlank()) {
+                        noExternalPeersHashes[infoHashHex] = now
+                        if (isAlreadyActiveRejection) {
+                            alreadyActiveRejectionHashes[infoHashHex] = now
+                            showDeadSwarmToastThrottled(
+                                infoHashHex,
+                                "North: NordicBytes tracker locked (${inspection.failureReason.take(90)}). Wait for auto-expiry or see North Settings.",
+                                postFollowUp = true
+                            )
+                            NorthDebugLogger.reportHandledFatalAsync(
+                                "TRACKER_ALREADY_ACTIVE",
+                                "NordicBytes rejected announce for ${infoHashHex.take(10)}: ${inspection.failureReason}",
+                                null
+                            )
+                        }
+                    }
+                    val selfCompact = inspection.compactPeersRaw
+                    if (!inspection.hasFailureReason && selfCompact != null && selfCompact.size >= 6) {
+                        buildShortIntervalCompactPeersBencode(selfCompact, intervalSec = 20)
+                    } else {
+                        emptyPeersBencode
+                    }
                 }
-            }
 
                 // Record result for single-flight dedup across TorrServer's simultaneous interface announces
                 session.lastUpstreamAttemptMs = System.currentTimeMillis()
                 session.lastUpstreamReplyBytes = peerBytes
 
-                // Only promote to Seeder (`left=0`) AFTER we actually received genuine external seedbox peers, and wait
-                // 35s so we never trip tracker `min_interval` rejections if the user quickly reopens or resumes!
-                if (validExternalPeersFound && !session.promotedToSeeder) {
+                // STEALTH PEER-LIST HIDING:
+                // Now that we have the live seedbox IP:port list cached in RAM & disk and returned to TorrServer,
+                // immediately leave the tracker peer list with `uploaded=0&downloaded=0&left=<size>&event=stopped`
+                // (~1.2s later) so:
+                // 1. Your IP is removed from NordicBytes' active peer list & Clients list right away.
+                // 2. 0 of 3 peer slots stay open (impossible to hit "You already have 3 peers" again).
+                // 3. 0 B download and left > 0 (not a snatch -> zero Hit-and-Run warnings).
+                // 4. TorrServer streams at full speed directly from the fetched seedboxes!
+                if (validExternalPeersFound) {
                     session.promotedToSeeder = true
-                    session.needsFreshPeerId = true
-                    thread(isDaemon = true, name = "North-RatioBooster") {
+                    thread(isDaemon = true, name = "North-StealthLeave") {
                         try {
-                            Thread.sleep(35_000L)
-                            // Skip promotion if peer_id rotated in the meantime (stream was reset/stopped)
-                            if (session.peerId != sessionPeerId) return@thread
-                            val boostUpload = session.cumulativeUploadedBytes
-                            val promoteQuery = (
-                                identParams + listOf(
-                                    "uploaded=$boostUpload",
-                                    "downloaded=0",
-                                    "corrupt=0",
-                                    "left=0",
-                                    "numwant=200",
-                                    "compact=1"
+                            Thread.sleep(1_200L)
+                            synchronized(hashLock) {
+                                if (session.peerId != sessionPeerId || !session.isPeerOpenOnTracker) return@synchronized
+                                val stealthStopQuery = (
+                                    identParams + listOf(
+                                        "uploaded=0",
+                                        "downloaded=0",
+                                        "corrupt=0",
+                                        peerDiscoveryLeft,
+                                        "numwant=0",
+                                        "compact=1",
+                                        "event=stopped"
+                                    )
+                                    ).joinToString("&")
+                                executeTrackerGet("$upstreamUrl$sep$stealthStopQuery", 3500)
+                                session.isPeerOpenOnTracker = false
+                                session.lastStoppedAtMs = System.currentTimeMillis()
+                                persistGhostPeerSession(
+                                    hashHex = infoHashHex,
+                                    peerId = sessionPeerId,
+                                    peerKey = sessionPeerKey,
+                                    peerPort = sessionPort,
+                                    uploadedBytes = 0L,
+                                    active = false,
+                                    upstreamUrl = upstreamUrl,
+                                    rawInfoHashParam = rawInfoHashParam
                                 )
-                                ).joinToString("&")
-                            val boostResp = executeTrackerGet("$upstreamUrl$sep$promoteQuery", 6000)
-                            if (isValidTrackerPeersResponse(boostResp, effectiveSelfIpv4) && boostResp != null && session.lastPeersResponse.isEmpty()) {
-                                session.lastPeersResponse = boostResp
+                                NorthDebugLogger.logTrackerEvent(infoHashHex, "Stealth-left tracker peer list cleanly (0 open peers, 0 B DL)")
                             }
                         } catch (_: Exception) {
                         }
@@ -3194,13 +3242,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
             for (entry in ghostSessions.entries) {
                 if (entry.key.contains(hash, ignoreCase = true)) {
-                    // Reset timestamps & force a fresh peer_id on next start so UNIT3D always returns live seedboxes,
-                    // while keeping lastPeersResponse as fallback if NordicBytes returns "Minimum announce interval not met".
+                    // Keep reusing the same open peer cleanly without forcing a new peer_id, while resetting
+                    // announce cooldowns so the next playback immediately fetches live seedboxes!
                     entry.value.lastAnnounceMs = 0L
                     entry.value.lastUpstreamAttemptMs = 0L
                     entry.value.lastUpstreamReplyBytes = ByteArray(0)
                     entry.value.promotedToSeeder = false
-                    entry.value.needsFreshPeerId = true
                 }
             }
         }
@@ -9781,7 +9828,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val sessionTs = System.currentTimeMillis()
                     val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=50"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=51"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
