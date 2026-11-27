@@ -2202,7 +2202,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     getCaseInsensitive(setsObj, "disableTCP") == false &&
                     getCaseInsensitive(setsObj, "disableUTP") == false &&
                     getCaseInsensitive(setsObj, "disableUPNP") == false &&
-                    getCaseInsensitive(setsObj, "enableIPv6") == true &&
+                    getCaseInsensitive(setsObj, "enableIPv6") == false &&
                     getCaseInsensitive(setsObj, "forceEncrypt") == false &&
                     getCaseInsensitive(setsObj, "disableUpload") == false &&
                     (getCaseInsensitive(setsObj, "downloadRateLimit") as? Number)?.toInt() == 0
@@ -2224,12 +2224,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 putCaseInsensitive(setsObj, "enableRutorSearch", false)
                 putCaseInsensitive(setsObj, "retrackersMode", 0) // Never inject public trackers into private torrents
                 putCaseInsensitive(setsObj, "torrentDisconnectTimeout", 600)
-                // Explicitly enable TCP, uTP, UPnP, and IPv6 so single home seeders (e.g. Transmission TCP-only
-                // or NATed home peers needing inbound UPnP or IPv6 peers6) are ALWAYS reachable!
+                // Explicitly enable TCP, uTP, and UPnP while keeping IPv6 false (TorrServer's safe Android
+                // default, avoiding Go dual-stack socket hangs/crashes on IPv4-only Android VPNs & Wi-Fi).
                 putCaseInsensitive(setsObj, "disableTCP", false)
                 putCaseInsensitive(setsObj, "disableUTP", false)
                 putCaseInsensitive(setsObj, "disableUPNP", false)
-                putCaseInsensitive(setsObj, "enableIPv6", true)
+                putCaseInsensitive(setsObj, "enableIPv6", false)
                 putCaseInsensitive(setsObj, "forceEncrypt", false)
                 putCaseInsensitive(setsObj, "disableUpload", false)
                 putCaseInsensitive(setsObj, "downloadRateLimit", 0)
@@ -3085,10 +3085,28 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             return Pair(fallbackEntry.first, fallbackEntry.second)
         }
 
+        private fun wipeCorruptTorrServerDb(cacheBase: String) {
+            torrServerTunedBaseUrl = ""
+            try {
+                val dir = File(cacheBase)
+                if (dir.exists() && dir.isDirectory) {
+                    for (name in listOf("config.db", "config.db.lock", "torrents.db", "settings.json", "accs.db")) {
+                        try {
+                            val f = File(dir, name)
+                            if (f.exists()) f.delete()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
         private fun startTorrServerDirectlyIfStopped(): String? {
             val currentUrl = resolveRunningTorrServerUrl()
             if (isTorrServerAlive(currentUrl)) return currentUrl
 
+            torrServerTunedBaseUrl = ""
             val cacheBase = try {
                 torrentsCacheDirPath.ifBlank {
                     val ctx = CommonActivity.activity ?: (getContext() as? Context)
@@ -3099,36 +3117,46 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 "/data/local/tmp/torrents"
             }
 
-            try {
-                File(cacheBase).mkdirs()
-                try {
-                    val seqClass = Class.forName("go.Seq")
-                    seqClass.getMethod("load").invoke(null)
-                } catch (_: Throwable) {
-                }
-                val tsClass = Class.forName("torrServer.TorrServer")
-                val startMethod = tsClass.getMethod("startTorrentServer", String::class.java, Long::class.javaPrimitiveType)
-                val port = (startMethod.invoke(null, cacheBase, 0L) as? Long) ?: -1L
-                if (port > 0L) {
-                    val startedUrl = "http://127.0.0.1:$port"
+            fun invokeStartOnce(): String? {
+                return try {
+                    File(cacheBase).mkdirs()
                     try {
-                        val field = Torrent::class.java.getDeclaredField("TORRENT_SERVER_URL")
-                        field.isAccessible = true
-                        field.set(null, startedUrl)
+                        val seqClass = Class.forName("go.Seq")
+                        seqClass.getMethod("load").invoke(null)
                     } catch (_: Throwable) {
                     }
-                    for (attempt in 0 until 20) {
-                        if (isTorrServerAlive(startedUrl)) return startedUrl
+                    val tsClass = Class.forName("torrServer.TorrServer")
+                    val startMethod = tsClass.getMethod("startTorrentServer", String::class.java, Long::class.javaPrimitiveType)
+                    val port = (startMethod.invoke(null, cacheBase, 0L) as? Long) ?: -1L
+                    if (port > 0L) {
+                        val startedUrl = "http://127.0.0.1:$port"
                         try {
-                            Thread.sleep(100L)
+                            val field = Torrent::class.java.getDeclaredField("TORRENT_SERVER_URL")
+                            field.isAccessible = true
+                            field.set(null, startedUrl)
                         } catch (_: Throwable) {
-                            break
+                        }
+                        for (attempt in 0 until 20) {
+                            if (isTorrServerAlive(startedUrl)) return startedUrl
+                            try {
+                                Thread.sleep(100L)
+                            } catch (_: Throwable) {
+                                break
+                            }
                         }
                     }
+                    null
+                } catch (_: Throwable) {
+                    null
                 }
-            } catch (_: Throwable) {
             }
-            return null
+
+            invokeStartOnce()?.let { return it }
+
+            // If a prior crash corrupted TorrServer's BoltDB config.db on disk, wipe only the local cache DB
+            // and restart cleanly (North always re-adds torrents fresh from NordicBytes, so zero user data is lost).
+            wipeCorruptTorrServerDb(cacheBase)
+            return invokeStartOnce()
         }
 
         /**
@@ -3214,14 +3242,16 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     if (isTorrServerAlive(baseUrl)) {
                         tuneTorrServerForFastStreaming(baseUrl)
 
+                        var reusableLiveStatus: JSONObject? = null
                         if (knownHash.isNotBlank()) {
                             val existingStatus = queryTorrServerStatus(baseUrl, knownHash)
-                            val isDeadOrStaleExisting = existingStatus != null && (
-                                forceReAdd ||
-                                    !isTorrServerStatusHealthyForPort(existingStatus, effectivePort, requireFiles = true) ||
-                                    !isTorrServerSwarmLive(existingStatus, knownHash, idleBeforeCallMs)
-                                )
-                            if (isDeadOrStaleExisting) {
+                            val isHealthyAndLive = existingStatus != null &&
+                                !forceReAdd &&
+                                isTorrServerStatusHealthyForPort(existingStatus, effectivePort, requireFiles = true) &&
+                                isTorrServerSwarmLive(existingStatus, knownHash, idleBeforeCallMs)
+                            if (isHealthyAndLive) {
+                                reusableLiveStatus = existingStatus
+                            } else if (existingStatus != null) {
                                 clearCachedStateForHash(knownHash)
                                 removeTorrServerHashSync(baseUrl, knownHash)
                                 try {
@@ -3257,9 +3287,31 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             return parsedObj
                         }
 
-                        var statusJson = postAddTorrent()
+                        var statusJson = reusableLiveStatus ?: postAddTorrent()
+                        if (statusJson == null && reusableLiveStatus == null) {
+                            // Self-heal if TorrServer's BT engine or settings DB was wedged after a crash
+                            try {
+                                val defConn = (URL("$baseUrl/settings").openConnection() as HttpURLConnection).apply {
+                                    requestMethod = "POST"
+                                    doOutput = true
+                                    setRequestProperty("Content-Type", "application/json")
+                                    connectTimeout = 2500
+                                    readTimeout = 2500
+                                }
+                                OutputStreamWriter(defConn.outputStream, Charsets.UTF_8).use {
+                                    it.write("""{"action":"def"}""")
+                                }
+                                defConn.responseCode
+                                defConn.disconnect()
+                                Thread.sleep(350L)
+                                torrServerTunedBaseUrl = ""
+                                tuneTorrServerForFastStreaming(baseUrl)
+                                statusJson = postAddTorrent()
+                            } catch (_: Throwable) {
+                            }
+                        }
                         var hash = statusJson?.optString("hash", "")?.trim().orEmpty()
-                        if (hash.isNotBlank() && statusJson != null) {
+                        if (reusableLiveStatus == null && hash.isNotBlank() && statusJson != null) {
                             // If TorrServer returned a pre-existing closed/stale-port torrent (or an old >30s
                             // 0-peer zombie from an earlier session when knownHash was blank), remove it via
                             // `action: "rem"` and re-add once cleanly. NEVER kill a brand-new add!
@@ -9398,7 +9450,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val sessionTs = System.currentTimeMillis()
                     val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=45"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=46"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true
@@ -9484,12 +9536,10 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             }
 
             // Defeat CloudStream's 20-minute RepoLinkGenerator cache reusing stale ExoPlayer SimpleCache spans
-            // when reopening a saved movie/episode without calling loadLinks().
+            // ONLY on a genuinely idle session start (never during an active mid-file timeline seek/scrub!).
             val rangeHeader = req.header("Range").orEmpty()
-            val isSessionStartReq = rangeHeader.isBlank() ||
-                rangeHeader.startsWith("bytes=0-", ignoreCase = true) ||
-                idleBeforeReqMs > 10_000L
-            if (isSessionStartReq && (nowBeforeResolve - lastSimpleCachePurgeMs) > 10_000L) {
+            val isStartRange = rangeHeader.isBlank() || rangeHeader.startsWith("bytes=0-", ignoreCase = true)
+            if (isStartRange && idleBeforeReqMs > 20_000L && (nowBeforeResolve - lastSimpleCachePurgeMs) > 20_000L) {
                 purgeStaleExoPlayerSimpleCache()
             }
 
@@ -9626,7 +9676,19 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 .withReadTimeout(if (!isSingleSource && knownNoExternalPeers) 12 else 60, TimeUnit.SECONDS)
                 .withWriteTimeout(60, TimeUnit.SECONDS)
 
+            fun isClientCancellation(err: Throwable): Boolean {
+                if (chain.call().isCanceled() || Thread.currentThread().isInterrupted) return true
+                if (err is java.io.InterruptedIOException && err !is SocketTimeoutException) return true
+                val msg = err.message.orEmpty().lowercase(Locale.ROOT)
+                return msg.contains("canceled") ||
+                    msg.contains("cancelled") ||
+                    msg.contains("socket closed") ||
+                    msg.contains("stream was reset") ||
+                    msg.contains("closed")
+            }
+
             fun retryWithFreshReAdd(): okhttp3.Response? {
+                if (chain.call().isCanceled()) return null
                 val retryQuery = castQueryForRetry?.takeIf { it.isNotBlank() } ?: return null
                 val portNow = ensureLocalProxyServer()
                 clearNorthRepoLinkCache()
@@ -9634,6 +9696,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     clearCachedStateForHash(activeHash)
                     removeTorrServerHashSync(resolveRunningTorrServerUrl(), activeHash)
                 }
+                if (chain.call().isCanceled()) return null
                 val refreshedTarget = resolveDirectTorrStreamFromCastQuery(
                     rawQuery = retryQuery,
                     localPort = portNow,
@@ -9651,6 +9714,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             var response = try {
                 initialChain.proceed(activeReq)
             } catch (ioe: java.io.IOException) {
+                // CRITICAL: Rapid timeline scrubbing (e.g. 00:00 -> 27:00) cancels the prior OkHttp call!
+                // Never treat a client seek/scrub cancellation as a dead torrent or call rem+add in TorrServer!
+                if (isClientCancellation(ioe)) {
+                    throw ioe
+                }
                 val base = resolveRunningTorrServerUrl()
                 val status = if (activeHash.isNotBlank()) queryTorrServerStatus(base, activeHash) else null
                 val healthy = isTorrServerStatusHealthyForPort(status, localPort, requireFiles = true)
@@ -9664,7 +9732,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // Torrent is healthy and actively downloading a large piece (e.g. resume seek) -> retry smoothly
                     try {
                         retryChain.proceed(activeReq)
-                    } catch (_: java.io.IOException) {
+                    } catch (retryErr: java.io.IOException) {
+                        if (isClientCancellation(retryErr)) throw retryErr
                         retryWithFreshReAdd() ?: throw ioe
                     }
                 } else if (stillNoExternalPeers && dlSpeed <= 0.0 && preloaded == 0L) {
@@ -9751,6 +9820,9 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                     }
                                     n
                                 } catch (bodyErr: java.io.IOException) {
+                                    if (isClientCancellation(bodyErr)) {
+                                        throw bodyErr
+                                    }
                                     if (!deliveredAnyByte && bodyErr is SocketTimeoutException && trackedHashLower.isNotBlank()) {
                                         // Real stall timeout with zero media bytes delivered after 206 headers:
                                         // check whether TorrServer is actively downloading or stalled at 0 B/s.

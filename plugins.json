@@ -1,15 +1,15 @@
 [
     {
-        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3?v=45",
+        "url": "https://raw.githubusercontent.com/sealinwater/north/builds/North.cs3?v=46",
         "status": 1,
-        "version": 45,
+        "version": 46,
         "name": "North",
         "internalName": "North",
         "authors": [
             "North • sealinwater"
         ],
         "description": "⚠️ ACCOUNT API KEY REQUIRED: You need a NordicBytes (nordicbytes.org) account and API key to use North. How to get set up: 1) Apply at https://nordicbytes.org/application. Everything you write in your application text and experience level is public so members can vouch for you, so never put your real name, address, or personal info in there. Your email and at least 2 tracker proof screenshots + profile links are only shown to staff (you do need proofs or the application gets rejected). 2) Once you can log in at nordicbytes.org, go to Profile -> Settings -> API Key and copy your UNIT3D API token. 3) In Cloudstream, go to Settings -> Extensions -> North (gear icon), paste your key, and hit Save. Includes the Nordic Aurora intro, seekable MKV/MP4 playback, Chromecast stereo audio support, skip intro buttons, and Ghost Ratio protection.",
-        "fileSize": 284878,
+        "fileSize": 286158,
         "repositoryUrl": "https://github.com/sealinwater/north",
         "language": "da",
         "tvTypes": [
@@ -20,6 +20,6 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/sealinwater/north/builds/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-b9061e9d4f1f6e48cb1e3521759a1f00f22e1c09ddec10c6708b4cfb1bdc1e2b"
+        "fileHash": "sha256-b31a5037393980e2f5bfd1fdaf1aab88642896af7db599f350a5626ca6376d56"
     }
 ]
