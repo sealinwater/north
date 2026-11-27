@@ -510,7 +510,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             "udp://open.demonii.com:1337/announce"
         )
 
-        const val DEFAULT_PROXY_API_URL =
+        internal const val DEFAULT_PROXY_API_URL =
             "https://ais-pre-fs5ruodr554drkqvwa77pe-203047830676.europe-west1.run.app"
 
         const val CDN_INTRO_VIDEO_URL =
@@ -573,6 +573,20 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
          * Even if the app crashes or is force-closed before sending `event=stopped`, the next launch derives
          * the EXACT SAME `peer_id` and immediately clears or updates the tracker row in <200ms (0-second reset!).
          */
+        private fun deriveDeterministicQbitPort(hashHex: String): Int {
+            val cleanHash = hashHex.trim().lowercase(Locale.ROOT)
+            if (cleanHash.isBlank()) return 51413
+            return try {
+                val salt = getOrCreateDevicePeerSalt()
+                val digest = MessageDigest.getInstance("SHA-256")
+                    .digest("$salt|$cleanHash|north-qbit-port-v49".toByteArray(Charsets.UTF_8))
+                val raw = ((digest[0].toInt() and 0xFF) shl 8) or (digest[1].toInt() and 0xFF)
+                49152 + (raw % 11000)
+            } catch (_: Throwable) {
+                51413
+            }
+        }
+
         private fun deriveDeterministicQbitIdentity(hashHex: String): Pair<String, String> {
             val cleanHash = hashHex.trim().lowercase(Locale.ROOT)
             if (cleanHash.isBlank()) return Pair(generateQbitPeerId(), generateQbitKey())
@@ -773,8 +787,11 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             @Volatile var promotedToSeeder: Boolean = false,
             @Volatile var peerId: String = generateQbitPeerId(),
             @Volatile var peerKey: String = generateQbitKey(),
+            @Volatile var peerPort: Int = 51413,
             @Volatile var needsFreshPeerId: Boolean = false,
-            @Volatile var lastStoppedAtMs: Long = 0L
+            @Volatile var lastStoppedAtMs: Long = 0L,
+            @Volatile var lastUpstreamAttemptMs: Long = 0L,
+            @Volatile var lastUpstreamReplyBytes: ByteArray = ByteArray(0)
         )
 
         data class CategoryPaginationState(
@@ -792,7 +809,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
         var playNorthIntroEnabled: Boolean = true
 
         @Volatile
-        var proxyApiBaseUrl: String = DEFAULT_PROXY_API_URL
+        internal var proxyApiBaseUrl: String = DEFAULT_PROXY_API_URL
 
         @Volatile
         var northIntroCacheFilePath: String = ""
@@ -2084,7 +2101,6 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                                 put("ok", true)
                                 put("service", "north-local-proxy")
                                 put("port", localPort)
-                                put("companionApi", proxyApiBaseUrl)
                                 put("torrServer", torrBase)
                                 put("torrServerAlive", isTorrServerAlive(torrBase))
                             }.toString()
@@ -2686,8 +2702,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     "ipv4" -> {
                         clientPublicIpv4 = safeUrlDecode(value).trim()
                     }
-                    "ipv6", "ip", "peer_id", "key", "downloaded", "corrupt", "uploaded", "numwant", "compact" -> {
-                        // Normalized below to match our whitelisted qBittorrent/4.6.5 client identity & Ghost Ratio
+                    "ipv6", "ip", "port", "peer_id", "key", "downloaded", "corrupt", "uploaded", "numwant", "compact" -> {
+                        // Normalized below to match our single deterministic whitelisted qBittorrent/4.6.5 identity & Ghost Ratio
                     }
                     "left" -> {
                         clientLeftParam = param
@@ -2710,7 +2726,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
             // Key by lowercase hex info_hash so clearCachedStateForHash(hash) always matches and resets sessions!
             val sessionHashKey = infoHashHex.ifBlank { rawInfoHashParam }
             val sessionKey = "$upstreamUrl|$sessionHashKey"
-            val now = System.currentTimeMillis()
+            val detPort = deriveDeterministicQbitPort(infoHashHex)
             val session = ghostSessions.getOrPut(sessionKey) {
                 val baseUpload = declaredTorrentSize.coerceIn(1_073_741_824L, 4_294_967_296L) +
                     Random.nextLong(15_000_000L, 120_000_000L)
@@ -2722,11 +2738,12 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 val savedUpload = persisted?.optLong("uploaded", baseUpload)?.coerceAtLeast(baseUpload) ?: baseUpload
                 val savedCompact = loadPersistedCompactPeersForHash(infoHashHex)
                 GhostSessionState(
-                    startTimeMs = now,
+                    startTimeMs = System.currentTimeMillis(),
                     cumulativeUploadedBytes = savedUpload,
                     lastPeersResponse = if (savedCompact != null) buildShortIntervalCompactPeersBencode(savedCompact, intervalSec = 25) else ByteArray(0),
                     peerId = savedPeerId,
                     peerKey = savedPeerKey,
+                    peerPort = detPort,
                     // Always stop any prior active/crashed deterministic peer_id first so UNIT3D resets it in <200ms!
                     needsFreshPeerId = savedActive || persisted != null
                 )
@@ -2734,64 +2751,36 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
             val sep = if (upstreamUrl.contains("?")) "&" else "?"
 
-            // When TorrServer stops playback, report final boosted upload + downloaded=0 + left=0 + event=stopped
-            // ONCE synchronously (1.2s cap) using our deterministic peer_id so UNIT3D clears the row cleanly
-            // without ever leaving an orphaned peer_id behind!
-            if (eventValue == "stopped") {
-                val finalUpload = session.cumulativeUploadedBytes
-                val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
-                val stopPeerId = session.peerId
-                val stopPeerKey = session.peerKey
-                val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
-                session.peerId = detPeerId
-                session.peerKey = detPeerKey
-                session.lastAnnounceMs = 0L
-                session.promotedToSeeder = false
-                session.needsFreshPeerId = false
-                session.lastStoppedAtMs = now
-                persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, finalUpload, active = false)
-                val stopQuery = (
-                    passthroughParams + listOf(
-                        "peer_id=$stopPeerId",
-                        "key=$stopPeerKey",
-                        "uploaded=$finalUpload",
-                        "downloaded=0",
-                        "corrupt=0",
-                        "left=0",
-                        "numwant=0",
-                        "compact=1",
-                        "event=stopped"
-                    )
-                    ).joinToString("&")
-                try {
-                    executeTrackerGet("$upstreamUrl$sep$stopQuery", 1200)
-                } catch (_: Throwable) {
-                }
-                NorthDebugLogger.logTrackerEvent(infoHashHex, "Sent event=stopped cleanly")
-                sendHttpResponse(sock, 200, "text/plain", cachedReply)
-                return
-            }
+            // Serialize all announces for the SAME torrent so TorrServer's simultaneous IPv4/IPv6/interface
+            // announces collapse into ONE single upstream tracker request and NEVER consume 3 peer slots!
+            val replyBytes: ByteArray = synchronized(session) {
+                val now = System.currentTimeMillis()
+                val sessionPort = session.peerPort
 
-            // If this session was previously active (e.g. promoted to seeder OR left orphaned by a crash on disk),
-            // cleanly stop that exact deterministic peer_id FIRST so UNIT3D resets the peer row immediately (<200ms)
-            // instead of rejecting the next announce as a duplicate client!
-            if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.needsFreshPeerId) {
-                val oldPeerId = session.peerId
-                val oldPeerKey = session.peerKey
-                val oldUpload = session.cumulativeUploadedBytes
-                val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
-                session.peerId = detPeerId
-                session.peerKey = detPeerKey
-                session.needsFreshPeerId = false
-                session.promotedToSeeder = false
-                session.lastStoppedAtMs = System.currentTimeMillis()
-                persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, oldUpload, active = false)
-                try {
-                    val cleanupStopQuery = (
+                // When TorrServer stops playback, report final boosted upload + downloaded=0 + left=0 + event=stopped
+                // ONCE synchronously (1.2s cap) using our deterministic peer_id + port so UNIT3D clears the row cleanly.
+                if (eventValue == "stopped") {
+                    val finalUpload = session.cumulativeUploadedBytes
+                    val cachedReply = if (session.lastPeersResponse.isNotEmpty()) session.lastPeersResponse else emptyPeersBencode
+                    val stopPeerId = session.peerId
+                    val stopPeerKey = session.peerKey
+                    val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
+                    session.peerId = detPeerId
+                    session.peerKey = detPeerKey
+                    session.peerPort = detPort
+                    session.lastAnnounceMs = 0L
+                    session.lastUpstreamAttemptMs = 0L
+                    session.lastUpstreamReplyBytes = ByteArray(0)
+                    session.promotedToSeeder = false
+                    session.needsFreshPeerId = false
+                    session.lastStoppedAtMs = now
+                    persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, finalUpload, active = false)
+                    val stopQuery = (
                         passthroughParams + listOf(
-                            "peer_id=$oldPeerId",
-                            "key=$oldPeerKey",
-                            "uploaded=$oldUpload",
+                            "port=$sessionPort",
+                            "peer_id=$stopPeerId",
+                            "key=$stopPeerKey",
+                            "uploaded=$finalUpload",
                             "downloaded=0",
                             "corrupt=0",
                             "left=0",
@@ -2800,70 +2789,112 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                             "event=stopped"
                         )
                         ).joinToString("&")
-                    executeTrackerGet("$upstreamUrl$sep$cleanupStopQuery", 1400)
-                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Auto-cleared prior active/crashed peer session via event=stopped")
-                } catch (_: Throwable) {
-                }
-            }
-
-            // Brief spacing after event=stopped so UNIT3D never rejects an immediate event=started for the same passkey
-            if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.lastStoppedAtMs > 0L) {
-                val sinceStopMs = System.currentTimeMillis() - session.lastStoppedAtMs
-                if (sinceStopMs in 0L..549L) {
                     try {
-                        Thread.sleep(550L - sinceStopMs)
+                        executeTrackerGet("$upstreamUrl$sep$stopQuery", 1200)
+                    } catch (_: Throwable) {
+                    }
+                    NorthDebugLogger.logTrackerEvent(infoHashHex, "Sent event=stopped cleanly")
+                    return@synchronized cachedReply
+                }
+
+                // Single-flight dedup: if another TorrServer interface just announced this exact torrent within 15s,
+                // return the exact same reply immediately without firing duplicate upstream announces!
+                if (session.lastUpstreamAttemptMs > 0L &&
+                    (now - session.lastUpstreamAttemptMs) < 15_000L &&
+                    session.lastUpstreamReplyBytes.isNotEmpty()
+                ) {
+                    return@synchronized session.lastUpstreamReplyBytes
+                }
+
+                // If this session was previously active (e.g. promoted to seeder OR left orphaned by a crash on disk),
+                // cleanly stop that exact deterministic peer_id + port FIRST so UNIT3D resets the peer row immediately.
+                if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.needsFreshPeerId) {
+                    val oldPeerId = session.peerId
+                    val oldPeerKey = session.peerKey
+                    val oldUpload = session.cumulativeUploadedBytes
+                    val (detPeerId, detPeerKey) = deriveDeterministicQbitIdentity(infoHashHex)
+                    session.peerId = detPeerId
+                    session.peerKey = detPeerKey
+                    session.peerPort = detPort
+                    session.needsFreshPeerId = false
+                    session.promotedToSeeder = false
+                    session.lastStoppedAtMs = System.currentTimeMillis()
+                    persistGhostPeerSession(infoHashHex, detPeerId, detPeerKey, oldUpload, active = false)
+                    try {
+                        val cleanupStopQuery = (
+                            passthroughParams + listOf(
+                                "port=$sessionPort",
+                                "peer_id=$oldPeerId",
+                                "key=$oldPeerKey",
+                                "uploaded=$oldUpload",
+                                "downloaded=0",
+                                "corrupt=0",
+                                "left=0",
+                                "numwant=0",
+                                "compact=1",
+                                "event=stopped"
+                            )
+                            ).joinToString("&")
+                        executeTrackerGet("$upstreamUrl$sep$cleanupStopQuery", 1400)
+                        NorthDebugLogger.logTrackerEvent(infoHashHex, "Auto-cleared prior active/crashed peer session via event=stopped")
                     } catch (_: Throwable) {
                     }
                 }
-            }
 
-            val sessionPeerId = session.peerId
-            val sessionPeerKey = session.peerKey
-            val identParams = passthroughParams + listOf("peer_id=$sessionPeerId", "key=$sessionPeerKey")
-
-            val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
-
-            // Always fetch fresh peers on `event=started` or whenever cached peers are >45 seconds old.
-            // Within 45s of a fresh announce, serve cached peers to non-`started` announces so we never
-            // trip NordicBytes' minimum announce interval while warming up a new stream.
-            val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
-                eventValue != "started" &&
-                (now - session.lastAnnounceMs) < 45_000L
-
-            if (cacheIsFresh) {
-                sendHttpResponse(sock, 200, "text/plain", session.lastPeersResponse)
-                if (now - session.lastAnnounceMs >= 120_000L) {
-                    session.lastAnnounceMs = now
-                    val updatedUpload = session.cumulativeUploadedBytes + (elapsedSec * 18_874_368L)
-                    if (updatedUpload > session.cumulativeUploadedBytes) {
-                        session.cumulativeUploadedBytes = updatedUpload
-                    }
-                    thread(isDaemon = true, name = "North-SeederHeartbeat") {
+                // Brief spacing after event=stopped so UNIT3D never rejects an immediate event=started for the same passkey
+                if ((eventValue == "started" || session.lastAnnounceMs == 0L) && session.lastStoppedAtMs > 0L) {
+                    val sinceStopMs = System.currentTimeMillis() - session.lastStoppedAtMs
+                    if (sinceStopMs in 0L..549L) {
                         try {
-                            val heartbeatQuery = (
-                                identParams + listOf(
-                                    "uploaded=${session.cumulativeUploadedBytes}",
-                                    "downloaded=0",
-                                    "corrupt=0",
-                                    "left=0",
-                                    "numwant=50",
-                                    "compact=1"
-                                )
-                                ).joinToString("&")
-                            // Do NOT overwrite session.lastPeersResponse with a left=0 response because
-                            // BitTorrent trackers omit seeders when replying to a left=0 seeder announce.
-                            executeTrackerGet("$upstreamUrl$sep$heartbeatQuery", 7000)
-                        } catch (_: Exception) {
+                            Thread.sleep(550L - sinceStopMs)
+                        } catch (_: Throwable) {
                         }
                     }
                 }
-                return
-            }
 
-            val sendStartedEvent = eventValue == "started" || session.lastAnnounceMs == 0L
-            if (sendStartedEvent || (now - session.lastAnnounceMs) >= 45_000L) {
-                session.promotedToSeeder = false
-            }
+                val sessionPeerId = session.peerId
+                val sessionPeerKey = session.peerKey
+                val identParams = passthroughParams + listOf("port=${session.peerPort}", "peer_id=$sessionPeerId", "key=$sessionPeerKey")
+
+                val elapsedSec = ((now - session.startTimeMs) / 1000L).coerceAtLeast(0L)
+
+                // Always fetch fresh peers on `event=started` (outside the 15s single-flight window) or whenever
+                // cached peers are >45 seconds old. Within 45s, serve cached peers to non-`started` announces.
+                val cacheIsFresh = session.lastPeersResponse.isNotEmpty() &&
+                    eventValue != "started" &&
+                    (now - session.lastAnnounceMs) < 45_000L
+
+                if (cacheIsFresh) {
+                    if (now - session.lastAnnounceMs >= 120_000L) {
+                        session.lastAnnounceMs = now
+                        val updatedUpload = session.cumulativeUploadedBytes + (elapsedSec * 18_874_368L)
+                        if (updatedUpload > session.cumulativeUploadedBytes) {
+                            session.cumulativeUploadedBytes = updatedUpload
+                        }
+                        thread(isDaemon = true, name = "North-SeederHeartbeat") {
+                            try {
+                                val heartbeatQuery = (
+                                    identParams + listOf(
+                                        "uploaded=${session.cumulativeUploadedBytes}",
+                                        "downloaded=0",
+                                        "corrupt=0",
+                                        "left=0",
+                                        "numwant=50",
+                                        "compact=1"
+                                    )
+                                    ).joinToString("&")
+                                executeTrackerGet("$upstreamUrl$sep$heartbeatQuery", 7000)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    return@synchronized session.lastPeersResponse
+                }
+
+                val sendStartedEvent = eventValue == "started" || session.lastAnnounceMs == 0L
+                if (sendStartedEvent || (now - session.lastAnnounceMs) >= 45_000L) {
+                    session.promotedToSeeder = false
+                }
 
             // Persist our active peer_id BEFORE sending event=started so even an immediate process crash
             // lets the very next launch cleanly send event=stopped for this exact peer_id!
@@ -3047,38 +3078,45 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                 }
             }
 
-            // Return the seedbox peer list (or short 10s-20s retry if empty/self-IP-only)
-            sendHttpResponse(sock, 200, "text/plain", peerBytes)
+                // Record result for single-flight dedup across TorrServer's simultaneous interface announces
+                session.lastUpstreamAttemptMs = System.currentTimeMillis()
+                session.lastUpstreamReplyBytes = peerBytes
 
-            // Only promote to Seeder (`left=0`) AFTER we actually received genuine external seedbox peers, and wait
-            // 35s so we never trip tracker `min_interval` rejections if the user quickly reopens or resumes!
-            if (validExternalPeersFound && !session.promotedToSeeder) {
-                session.promotedToSeeder = true
-                session.needsFreshPeerId = true
-                thread(isDaemon = true, name = "North-RatioBooster") {
-                    try {
-                        Thread.sleep(35_000L)
-                        // Skip promotion if peer_id rotated in the meantime (stream was reset/stopped)
-                        if (session.peerId != sessionPeerId) return@thread
-                        val boostUpload = session.cumulativeUploadedBytes
-                        val promoteQuery = (
-                            identParams + listOf(
-                                "uploaded=$boostUpload",
-                                "downloaded=0",
-                                "corrupt=0",
-                                "left=0",
-                                "numwant=200",
-                                "compact=1"
-                            )
-                            ).joinToString("&")
-                        val boostResp = executeTrackerGet("$upstreamUrl$sep$promoteQuery", 6000)
-                        if (isValidTrackerPeersResponse(boostResp, effectiveSelfIpv4) && boostResp != null && session.lastPeersResponse.isEmpty()) {
-                            session.lastPeersResponse = boostResp
+                // Only promote to Seeder (`left=0`) AFTER we actually received genuine external seedbox peers, and wait
+                // 35s so we never trip tracker `min_interval` rejections if the user quickly reopens or resumes!
+                if (validExternalPeersFound && !session.promotedToSeeder) {
+                    session.promotedToSeeder = true
+                    session.needsFreshPeerId = true
+                    thread(isDaemon = true, name = "North-RatioBooster") {
+                        try {
+                            Thread.sleep(35_000L)
+                            // Skip promotion if peer_id rotated in the meantime (stream was reset/stopped)
+                            if (session.peerId != sessionPeerId) return@thread
+                            val boostUpload = session.cumulativeUploadedBytes
+                            val promoteQuery = (
+                                identParams + listOf(
+                                    "uploaded=$boostUpload",
+                                    "downloaded=0",
+                                    "corrupt=0",
+                                    "left=0",
+                                    "numwant=200",
+                                    "compact=1"
+                                )
+                                ).joinToString("&")
+                            val boostResp = executeTrackerGet("$upstreamUrl$sep$promoteQuery", 6000)
+                            if (isValidTrackerPeersResponse(boostResp, effectiveSelfIpv4) && boostResp != null && session.lastPeersResponse.isEmpty()) {
+                                session.lastPeersResponse = boostResp
+                            }
+                        } catch (_: Exception) {
                         }
-                    } catch (_: Exception) {
                     }
                 }
+
+                peerBytes
             }
+
+            // Return the seedbox peer list (or short 10s-20s retry if empty/self-IP-only)
+            sendHttpResponse(sock, 200, "text/plain", replyBytes)
         }
 
         private fun isTorrServerAlive(baseUrl: String): Boolean {
@@ -3126,6 +3164,8 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     // Reset timestamps & force a fresh peer_id on next start so UNIT3D always returns live seedboxes,
                     // while keeping lastPeersResponse as fallback if NordicBytes returns "Minimum announce interval not met".
                     entry.value.lastAnnounceMs = 0L
+                    entry.value.lastUpstreamAttemptMs = 0L
+                    entry.value.lastUpstreamReplyBytes = ByteArray(0)
                     entry.value.promotedToSeeder = false
                     entry.value.needsFreshPeerId = true
                 }
@@ -7617,9 +7657,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
 
     private val companionProxyUrl: String
         get() {
-            val url = (prefs?.getString("proxy_api_url", DEFAULT_PROXY_API_URL) ?: DEFAULT_PROXY_API_URL)
-                .trim()
-                .trimEnd('/')
+            val url = DEFAULT_PROXY_API_URL.trim().trimEnd('/')
             proxyApiBaseUrl = url
             return url
         }
@@ -9710,7 +9748,7 @@ class NordicBytesProvider(private val customPrefs: SharedPreferences? = null) : 
                     val sessionTs = System.currentTimeMillis()
                     val totalSourcesCount = sortedPayloads.size.coerceAtLeast(1)
                     val unifiedStreamUrl =
-                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=48"
+                        "http://$streamHost:$localPort/cast/stream.$streamExt?index=$exactFileIndex&pack=$packFlag&s=$targetSeason&e=$targetEp&cast=$castFlag&url=$encUrl&token=$encTok&ghost=$ghostFlag&hash=$encHash&dn=$encTitle&tr=$encTracker&sz=$totalSz&srcs=$totalSourcesCount&ts=$sessionTs&v=49"
 
                     if (!prewarmedTopStream) {
                         prewarmedTopStream = true

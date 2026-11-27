@@ -32,7 +32,7 @@ import kotlin.concurrent.thread
  */
 object NorthDebugLogger {
 
-    private const val PLUGIN_VERSION = 48
+    private const val PLUGIN_VERSION = 49
     private const val LOG_FILE_NAME = "north_debug.log"
     private const val PREV_LOG_FILE_NAME = "north_debug.prev.log"
     private const val PENDING_CRASH_FILE_NAME = "north_pending_crash.json"
@@ -79,6 +79,7 @@ object NorthDebugLogger {
     private val bearerRegex = Regex("""(?i)(Bearer\s+)([A-Za-z0-9._\-+/=]+)""")
     private val announcePasskeyRegex = Regex("""(?i)(/announce/)([0-9a-f]{16,})""")
     private val torrentPasskeyRegex = Regex("""(?i)(/torrents/download/\d+\.)([0-9a-f]{16,})""")
+    private val privateProxyRegex = Regex("""(?i)https?://[^\s"'/]*(?:ais-(?:pre|dev)-|\.run\.app)[^\s"']*""")
 
     fun redactSecrets(raw: String): String {
         if (raw.isBlank()) return raw
@@ -87,6 +88,7 @@ object NorthDebugLogger {
         s = bearerRegex.replace(s, "$1[REDACTED]")
         s = announcePasskeyRegex.replace(s, "$1[REDACTED]")
         s = torrentPasskeyRegex.replace(s, "$1[REDACTED]")
+        s = privateProxyRegex.replace(s, "[PRIVATE_API]")
         return s
     }
 

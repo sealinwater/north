@@ -128,8 +128,10 @@ class NordicBytesPlugin : Plugin() {
         NordicBytesProvider.northIntroCacheFilePath = "${appContext.cacheDir.path}/north_intro.mp4"
         NordicBytesProvider.isSkipIntrosEnabled = prefs.getBoolean("skip_intros", true)
         NordicBytesProvider.playNorthIntroEnabled = prefs.getBoolean("play_north_intro", true)
-        NordicBytesProvider.proxyApiBaseUrl = (prefs.getString("proxy_api_url", NordicBytesProvider.DEFAULT_PROXY_API_URL)
-            ?: NordicBytesProvider.DEFAULT_PROXY_API_URL).trim().trimEnd('/')
+        if (prefs.contains("proxy_api_url")) {
+            prefs.edit().remove("proxy_api_url").apply()
+        }
+        NordicBytesProvider.proxyApiBaseUrl = NordicBytesProvider.DEFAULT_PROXY_API_URL.trim().trimEnd('/')
         NorthDebugLogger.init(appContext, NordicBytesProvider.proxyApiBaseUrl)
         NorthPlayerGuard.startActivityLifecycleWatcher(appContext)
         if (prefs.getInt("exo_cache_purged_version", 0) < 33) {
@@ -319,8 +321,6 @@ class NordicBytesPlugin : Plugin() {
         val currentPlayNorthIntro = prefs.getBoolean("play_north_intro", true)
         val currentAutoSubtitles = prefs.getBoolean("auto_subtitles", true)
         val currentPrefLanguage = prefs.getString("pref_language", "DA") ?: "DA"
-        val currentProxyApiUrl = prefs.getString("proxy_api_url", NordicBytesProvider.DEFAULT_PROXY_API_URL)
-            ?: NordicBytesProvider.DEFAULT_PROXY_API_URL
         val currentQbitUrl = prefs.getString("qbit_url", "") ?: ""
         val currentQbitUser = prefs.getString("qbit_user", "") ?: ""
         val currentQbitPass = prefs.getString("qbit_pass", "") ?: ""
@@ -337,7 +337,7 @@ class NordicBytesPlugin : Plugin() {
         }
 
         val subtitle = TextView(context).apply {
-            text = "NORTH • SEALINWATER • V48"
+            text = "NORTH • SEALINWATER • V49"
             textSize = 11f
             setTextColor(Color.parseColor("#38BDF8"))
             typeface = Typeface.DEFAULT_BOLD
@@ -697,34 +697,8 @@ class NordicBytesPlugin : Plugin() {
         }
         prefCard.addView(autoSubsSwitch)
 
-        val proxyApiTitle = TextView(context).apply {
-            text = "North Companion Proxy API URL"
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(context, 8), 0, dp(context, 4))
-        }
-        prefCard.addView(proxyApiTitle)
-
-        val proxyApiInput = EditText(context).apply {
-            hint = NordicBytesProvider.DEFAULT_PROXY_API_URL
-            setHintTextColor(Color.parseColor("#64748B"))
-            setText(currentProxyApiUrl)
-            setTextColor(Color.WHITE)
-            textSize = 11.5f
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setSingleLine(true)
-            setPadding(dp(context, 10), dp(context, 7), dp(context, 10), dp(context, 7))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#050D1D"))
-                cornerRadius = dp(context, 8).toFloat()
-                setStroke(dp(context, 1), Color.parseColor("#1E40AF"))
-            }
-        }
-        prefCard.addView(proxyApiInput)
-
         val continuityNote = TextView(context).apply {
-            text = "✓ Seekable Timeline & Companion API: Plays the NORTH title intro before content, listens on the North Proxy API + local 0.0.0.0 proxy for skip stamps/subtitles/streams, and preserves full forward/backward timeline seeking."
+            text = "✓ Seekable Timeline & Intro Engine: Plays the NORTH title intro before content, handles skip markers and subtitles automatically, and preserves full forward/backward timeline seeking."
             textSize = 10.5f
             setTextColor(Color.parseColor("#93C5FD"))
             setPadding(0, dp(context, 6), 0, 0)
@@ -882,7 +856,7 @@ class NordicBytesPlugin : Plugin() {
             setOnClickListener {
                 try {
                     val logText = buildString {
-                        append("=== North v48 Debug Log ===\n")
+                        append("=== North v49 Debug Log ===\n")
                         append(NordicBytesProvider.getLastTrackerDiagnosticSummary()).append("\n\n")
                         append(NorthDebugLogger.getRecentLines(120).joinToString("\n"))
                     }
@@ -926,7 +900,6 @@ class NordicBytesPlugin : Plugin() {
             }
             setOnClickListener {
                 val token = input.text.toString().trim()
-                val proxyApiUrl = proxyApiInput.text.toString().trim().trimEnd('/')
                 prefs.edit()
                     .putString("api_token", token)
                     .putBoolean("ghost_ratio", ghostRatioSwitch.isChecked)
@@ -935,15 +908,15 @@ class NordicBytesPlugin : Plugin() {
                     .putBoolean("skip_intros", skipIntroSwitch.isChecked)
                     .putBoolean("auto_subtitles", autoSubsSwitch.isChecked)
                     .putString("pref_language", selectedLang)
-                    .putString("proxy_api_url", proxyApiUrl)
+                    .remove("proxy_api_url")
                     .putString("qbit_url", qbitUrlInput.text.toString().trim().trimEnd('/'))
                     .putString("qbit_user", qbitUserInput.text.toString().trim())
                     .putString("qbit_pass", qbitPassInput.text.toString().trim())
                     .putString("discord_webhook", webhookInput.text.toString().trim())
                     .commit()
                 NordicBytesProvider.playNorthIntroEnabled = playNorthIntroSwitch.isChecked
-                NordicBytesProvider.proxyApiBaseUrl = proxyApiUrl
-                NorthDebugLogger.updateUploadBaseUrl(proxyApiUrl)
+                NordicBytesProvider.proxyApiBaseUrl = NordicBytesProvider.DEFAULT_PROXY_API_URL.trim().trimEnd('/')
+                NorthDebugLogger.updateUploadBaseUrl(NordicBytesProvider.proxyApiBaseUrl)
                 NordicBytesProvider.precacheNorthIntroAsync()
                 NordicBytesProvider.clearCaches()
                 Toast.makeText(context, "North settings saved! Restarting...", Toast.LENGTH_SHORT).show()
